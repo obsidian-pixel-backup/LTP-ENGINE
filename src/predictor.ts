@@ -15,6 +15,13 @@ import {
   runFullDiagnostics,
 } from "./analysis";
 
+const MONTE_CARLO_MIN_TRIALS = 4000;
+const MONTE_CARLO_MAX_TRIALS = 20000;
+const BACKTEST_DIAGNOSTICS_REFRESH_EVERY = 5;
+const HISTORICAL_ECHO_MAX_DRAWS = 320;
+const HISTORICAL_ECHO_MAX_WINDOWS = 120;
+const HISTORICAL_ECHO_TOP_MATCHES = 3;
+
 function hashStringToSeed(value: string): number {
   let hash = 2166136261;
   for (let i = 0; i < value.length; i++) {
@@ -32,6 +39,48 @@ function createSeededRandom(seed: number): () => number {
     t = Math.imul(t ^ (t >>> 15), t | 1);
     t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+type TransitionEntry = FullDiagnostics["transitions"][number];
+
+function transitionKey(lag: number, fromNumber: number): string {
+  return `${lag}:${fromNumber}`;
+}
+
+interface TransitionLookup {
+  transitionByLagFrom: Map<string, TransitionEntry>;
+  lag1TransitionByFrom: Map<number, TransitionEntry>;
+  lag1HighConfidenceTargetsByFrom: Map<number, Set<number>>;
+}
+
+function buildTransitionLookup(transitions: TransitionEntry[]): TransitionLookup {
+  const transitionByLagFrom = new Map<string, TransitionEntry>();
+  const lag1TransitionByFrom = new Map<number, TransitionEntry>();
+  const lag1HighConfidenceTargetsByFrom = new Map<number, Set<number>>();
+
+  for (const transition of transitions) {
+    transitionByLagFrom.set(
+      transitionKey(transition.lag, transition.fromNumber),
+      transition,
+    );
+    if (transition.lag === 1) {
+      lag1TransitionByFrom.set(transition.fromNumber, transition);
+      lag1HighConfidenceTargetsByFrom.set(
+        transition.fromNumber,
+        new Set(
+          transition.toNumbers
+            .filter((to) => to.probability > 0.3)
+            .map((to) => to.number),
+        ),
+      );
+    }
+  }
+
+  return {
+    transitionByLagFrom,
+    lag1TransitionByFrom,
+    lag1HighConfidenceTargetsByFrom,
   };
 }
 
@@ -197,9 +246,14 @@ export function compositeScoring(
   const bayesian = bayesianSmoothed(draws, N);
   const bayesMax = Math.max(...bayesian.map((b) => b.posterior));
   const bayesMin = Math.min(...bayesian.map((b) => b.posterior));
+  const bayesianPosteriorByNumber = new Array(N + 1).fill(0);
+  for (const b of bayesian) {
+    bayesianPosteriorByNumber[b.number] = b.posterior;
+  }
 
   const hcMap = new Map(diagnostics.hotCold.map((h) => [h.number, h]));
   const gapMap = new Map(diagnostics.gaps.map((g) => [g.number, g]));
+  const { transitionByLagFrom } = buildTransitionLookup(diagnostics.transitions);
 
   // PHASE 6: Noise Floor Utility (filter out weak signals) - UPDATED: removed arbitrary threshold
   const filterNoise = (val: number) => Math.max(0, val);
@@ -245,9 +299,7 @@ export function compositeScoring(
     const lagWeight = Math.pow(0.5, lag - 1); // 1.0, 0.5, 0.25, 0.125
 
     for (const ln of lagNums) {
-      const trans = diagnostics.transitions.find(
-        (t) => t.lag === lag && t.fromNumber === ln,
-      );
+      const trans = transitionByLagFrom.get(transitionKey(lag, ln));
       if (trans) {
         for (const to of trans.toNumbers) {
           // PHASE 5: Exponential Transition Utility
@@ -264,10 +316,10 @@ export function compositeScoring(
   const scores: NumberScore[] = [];
 
   for (let i = 1; i <= N; i++) {
-    const b = bayesian.find((x) => x.number === i)!;
+    const posterior = bayesianPosteriorByNumber[i];
     const bayesianScore =
       bayesMax > bayesMin
-        ? (b.posterior - bayesMin) / (bayesMax - bayesMin)
+        ? (posterior - bayesMin) / (bayesMax - bayesMin)
         : 0.5;
 
     const hc = hcMap.get(i);
@@ -389,37 +441,67 @@ function computeBalancePenalty(nums: number[], N: number): number {
   return (oePenalty + sumPenalty + consPenalty) / 3;
 }
 
+interface ScoringLookup extends TransitionLookup {
+  scoreByNumber: Map<number, NumberScore>;
+  groupPatternPercentageByBreakdown: Map<string, number>;
+  deltaPercentageByValue: Map<number, number>;
+}
+
+function createScoringLookup(
+  scores: NumberScore[],
+  diag: FullDiagnostics,
+): ScoringLookup {
+  const scoreByNumber = new Map(scores.map((score) => [score.number, score]));
+  const groupPatternPercentageByBreakdown = new Map(
+    diag.groupPatterns.map((pattern) => [pattern.pattern, pattern.percentage]),
+  );
+  const deltaPercentageByValue = new Map(
+    diag.deltas.map((delta) => [delta.delta, delta.percentage]),
+  );
+
+  return {
+    scoreByNumber,
+    groupPatternPercentageByBreakdown,
+    deltaPercentageByValue,
+    ...buildTransitionLookup(diag.transitions),
+  };
+}
+
 function setScore(
   nums: number[],
   scores: NumberScore[],
   N: number,
   diag: FullDiagnostics,
+  lookup: ScoringLookup = createScoringLookup(scores, diag),
 ): number {
-  const compositeSum = nums.reduce((sum, n) => {
-    const s = scores.find((x) => x.number === n);
-    return sum + (s ? s.compositeScore : 0);
-  }, 0);
+  const numSet = new Set(nums);
+
+  const compositeSum = nums.reduce(
+    (sum, n) => sum + (lookup.scoreByNumber.get(n)?.compositeScore || 0),
+    0,
+  );
 
   const groupBonus = computeGroupBalanceScore(nums, N) * 0.1;
 
   // Pattern Bonus: favor patterns that appear in history
   const breakdown = getGroupBreakdown(nums, N);
-  const patternMatch = diag.groupPatterns.find((p) => p.pattern === breakdown);
-  const patternBonus = patternMatch ? (patternMatch.percentage / 100) * 1.5 : 0;
+  const patternPct =
+    lookup.groupPatternPercentageByBreakdown.get(breakdown) || 0;
+  const patternBonus = (patternPct / 100) * 1.5;
 
   // Relationship Bonus: EXPONENTIAL scaling for high-order clusters
   let relationshipBonus = 0;
   for (const t of diag.topTriples) {
-    if (nums.includes(t.i) && nums.includes(t.j) && nums.includes(t.k)) {
+    if (numSet.has(t.i) && numSet.has(t.j) && numSet.has(t.k)) {
       relationshipBonus += Math.pow(1.5, 1); // base bonus
     }
   }
   for (const q of diag.topQuadruples) {
     if (
-      nums.includes(q.i) &&
-      nums.includes(q.j) &&
-      nums.includes(q.k) &&
-      nums.includes(q.l)
+      numSet.has(q.i) &&
+      numSet.has(q.j) &&
+      numSet.has(q.k) &&
+      numSet.has(q.l)
     ) {
       relationshipBonus += Math.pow(1.5, 2); // squared
     }
@@ -427,11 +509,11 @@ function setScore(
   if (diag.topQuintets) {
     for (const q of diag.topQuintets) {
       if (
-        nums.includes(q.i) &&
-        nums.includes(q.j) &&
-        nums.includes(q.k) &&
-        nums.includes(q.l) &&
-        nums.includes(q.m)
+        numSet.has(q.i) &&
+        numSet.has(q.j) &&
+        numSet.has(q.k) &&
+        numSet.has(q.l) &&
+        numSet.has(q.m)
       ) {
         relationshipBonus += Math.pow(1.5, 3); // cubed (aggressive reward)
       }
@@ -440,7 +522,7 @@ function setScore(
   // Transition Bonus (Exponential)
   let transitionBonus = 0;
   for (const n of nums) {
-    const s = scores.find((x) => x.number === n);
+    const s = lookup.scoreByNumber.get(n);
     if (s && s.transitionScore > 0.4)
       transitionBonus += Math.pow(s.transitionScore, 2);
   }
@@ -454,11 +536,8 @@ function setScore(
     for (let j = i + 1; j < sortedNums.length; j++) {
       const a = sortedNums[i];
       const b = sortedNums[j];
-      const trans = diag.transitions.find((t) => t.fromNumber === a);
-      if (
-        trans &&
-        trans.toNumbers.some((to) => to.number === b && to.probability > 0.3)
-      ) {
+      const followers = lookup.lag1HighConfidenceTargetsByFrom.get(a);
+      if (followers?.has(b)) {
         chainBonus += 1.5; // Significant boost for a validated sequential link
       }
     }
@@ -469,23 +548,23 @@ function setScore(
   const sorted = [...nums].sort((a, b) => a - b);
   for (let i = 0; i < sorted.length - 1; i++) {
     const d = sorted[i + 1] - sorted[i];
-    const stat = diag.deltas.find((x) => x.delta === d);
-    if (!stat || stat.percentage < 1.0) deltaPenalty += 0.3;
+    const deltaPct = lookup.deltaPercentageByValue.get(d);
+    if (!deltaPct || deltaPct < 1.0) deltaPenalty += 0.3;
   }
 
   // PHASE 7: Match Density Reward
   // Identify how many numbers in the set are 'Anchored' by high-order relationships
   const relationshipNodes = new Set<number>();
   for (const t of diag.topTriples) {
-    if (nums.includes(t.i)) relationshipNodes.add(t.i);
-    if (nums.includes(t.j)) relationshipNodes.add(t.j);
-    if (nums.includes(t.k)) relationshipNodes.add(t.k);
+    if (numSet.has(t.i)) relationshipNodes.add(t.i);
+    if (numSet.has(t.j)) relationshipNodes.add(t.j);
+    if (numSet.has(t.k)) relationshipNodes.add(t.k);
   }
   for (const q of diag.topQuadruples) {
-    if (nums.includes(q.i)) relationshipNodes.add(q.i);
-    if (nums.includes(q.j)) relationshipNodes.add(q.j);
-    if (nums.includes(q.k)) relationshipNodes.add(q.k);
-    if (nums.includes(q.l)) relationshipNodes.add(q.l);
+    if (numSet.has(q.i)) relationshipNodes.add(q.i);
+    if (numSet.has(q.j)) relationshipNodes.add(q.j);
+    if (numSet.has(q.k)) relationshipNodes.add(q.k);
+    if (numSet.has(q.l)) relationshipNodes.add(q.l);
   }
 
   // Reward density: if more than 3 numbers are part of validated clusters, it's a high-probability set
@@ -518,12 +597,13 @@ export function generateCandidateSets(
 ): PredictedSet[] {
   const N = diagnostics.poolSize;
   const candidates: PredictedSet[] = [];
+  const scoringLookup = createScoringLookup(scores, diagnostics);
 
   const addSet = (nums: number[], method: string) => {
     const sorted = nums.slice(0, K).sort((a, b) => a - b);
     candidates.push({
       numbers: sorted,
-      totalScore: setScore(sorted, scores, N, diagnostics),
+      totalScore: setScore(sorted, scores, N, diagnostics, scoringLookup),
       groupBreakdown: getGroupBreakdown(sorted, N),
       relativeLift: 0,
       method,
@@ -605,10 +685,17 @@ export function generateCandidateSets(
       totalComposite > 0
         ? scores.map((s) => s.compositeScore / totalComposite)
         : scores.map(() => 1 / Math.max(1, scores.length));
+    const maxTrials = Math.min(
+      MONTE_CARLO_MAX_TRIALS,
+      Math.max(MONTE_CARLO_MIN_TRIALS, draws.length * 25),
+    );
+    const earlyStopPatience = Math.max(1200, Math.floor(maxTrials * 0.2));
+    const minTrialsBeforeEarlyStop = Math.floor(maxTrials * 0.35);
     let bestMC: number[] = [];
     let bestMCScore = -Infinity;
+    let staleTrials = 0;
 
-    for (let trial = 0; trial < 20000; trial++) {
+    for (let trial = 0; trial < maxTrials; trial++) {
       let set: number[] = [];
       const available = scores.map((s, idx) => ({
         number: s.number,
@@ -652,10 +739,17 @@ export function generateCandidateSets(
       const { odd } = getOddEvenSplit(set);
       if (odd === 0 || odd === 6) continue;
 
-      const score = setScore(set, scores, N, diagnostics);
+      const score = setScore(set, scores, N, diagnostics, scoringLookup);
       if (score > bestMCScore) {
         bestMCScore = score;
         bestMC = [...set];
+        staleTrials = 0;
+      } else {
+        staleTrials++;
+      }
+
+      if (trial >= minTrialsBeforeEarlyStop && staleTrials >= earlyStopPatience) {
+        break;
       }
     }
     addSet(bestMC.length === K ? bestMC : scores.slice(0, K).map((s) => s.number), "Monte Carlo Best");
@@ -747,9 +841,7 @@ export function generateCandidateSets(
     if (lastDraw) {
       const seeds = [...lastDraw.numbers, lastDraw.bonus].filter((n) => n > 0);
       for (const s of seeds) {
-        const trans = diagnostics.transitions.find(
-          (t) => t.lag === 1 && t.fromNumber === s,
-        );
+        const trans = scoringLookup.lag1TransitionByFrom.get(s);
         if (trans) {
           for (const to of trans.toNumbers) {
             if (!flowSet.includes(to.number)) flowSet.push(to.number);
@@ -824,15 +916,11 @@ export function generateCandidateSets(
 
     // Follow the strongest 2-step chains starting from last draw's numbers
     for (const startNum of lastNums) {
-      const step1 = diagnostics.transitions.find(
-        (t) => t.lag === 1 && t.fromNumber === startNum,
-      );
+      const step1 = scoringLookup.lag1TransitionByFrom.get(startNum);
       if (step1 && step1.toNumbers.length > 0) {
         const next1 = step1.toNumbers[0].number;
         chainSet.add(next1);
-        const step2 = diagnostics.transitions.find(
-          (t) => t.lag === 1 && t.fromNumber === next1,
-        );
+        const step2 = scoringLookup.lag1TransitionByFrom.get(next1);
         if (step2 && step2.toNumbers.length > 0) {
           chainSet.add(step2.toNumbers[0].number);
         }
@@ -855,7 +943,7 @@ export function generateCandidateSets(
       .map((n) => ({
         number: n,
         consensus: numFreq[n],
-        score: scores.find((s) => s.number === n)?.compositeScore || 0,
+        score: scoringLookup.scoreByNumber.get(n)?.compositeScore || 0,
       }))
       .sort(
         (a, b) => b.consensus * 10 + b.score - (a.consensus * 10 + a.score),
@@ -867,7 +955,7 @@ export function generateCandidateSets(
   }
 
   // 8. Historical Echo (numbers from eras with similar statistical profiles)
-  {
+  if (draws.length <= HISTORICAL_ECHO_MAX_DRAWS) {
     const echoes = findHistoricalEchoes(scores, diagnostics, draws);
     if (echoes.length >= K) {
       addSet(echoes.slice(0, K), "Historical Echo");
@@ -944,7 +1032,7 @@ export function backtest(
       trainSize: draws.length,
       testSize: 0,
       modelHits: 0,
-      baselineHitRate: 7 / N,
+      baselineHitRate: K / N,
       modelHitRate: 0,
       improvement: 0,
       top6Overlap: 0,
@@ -1022,8 +1110,10 @@ export function backtest(
 
   // Iterative Learning Loop: for each test draw, predict -> validate -> learn
   const history = [...trainDraws];
+  const rollingWindow = 50;
 
-  for (const testDraw of testDraws) {
+  for (let testIdx = 0; testIdx < testDraws.length; testIdx++) {
+    const testDraw = testDraws[testIdx];
     // 1. Predict using current best profile and latest diagnostics
     const currentScores = compositeScoring(
       currentDiagnostics,
@@ -1058,7 +1148,6 @@ export function backtest(
 
     // 3. Reinforcement update without leakage:
     // evaluate profile predictions built from pre-outcome history only.
-    const rollingWindow = 50;
     WEIGHT_PROFILES.forEach((p, idx) => {
       const ps = compositeScoring(currentDiagnostics, history, p);
       const profileSeed = `${testDraw.date}:${history.length}:${p.name}`;
@@ -1074,9 +1163,7 @@ export function backtest(
       const po = actualMain.filter((n) => pt6.has(n)).length;
 
       // Update rolling overlap (we store per-draw result and sum the last 50)
-      if (!profilePerformance[idx].rollingHistory)
-        (profilePerformance[idx] as any).rollingHistory = [];
-      const rh = (profilePerformance[idx] as any).rollingHistory as number[];
+      const rh = profilePerformance[idx].rollingHistory!;
       rh.push(matchUtility(po));
       if (rh.length > rollingWindow) rh.shift();
       profilePerformance[idx].overlap = rh.reduce((a, b) => a + b, 0);
@@ -1084,7 +1171,12 @@ export function backtest(
 
     // 4. "Learn" - Update history and diagnostics for the NEXT prediction
     history.push(testDraw);
-    currentDiagnostics = runFullDiagnostics(history);
+    const shouldRefreshDiagnostics =
+      testIdx === testDraws.length - 1 ||
+      (testIdx + 1) % BACKTEST_DIAGNOSTICS_REFRESH_EVERY === 0;
+    if (shouldRefreshDiagnostics) {
+      currentDiagnostics = runFullDiagnostics(history);
+    }
 
     // Strategy: Every 5 draws, compute a NEURAL ENSEMBLE profile (Phase 7)
     // We blend all profiles based on their rolling overlap squared (to favor experts)
@@ -1249,6 +1341,7 @@ function runGeneticOptimization(
   const N = diag.poolSize;
   const topN = 24; // Compress search space to top 24 numbers
   const numPool = scores.slice(0, topN).map((s) => s.number);
+  const scoringLookup = createScoringLookup(scores, diag);
 
   // Initial Population
   let population: number[][] = [];
@@ -1265,7 +1358,7 @@ function runGeneticOptimization(
     // 1. Fitness Calculation
     // PHASE 7: Aggressively target "Match Density" (high overlap probability)
     const fitnessResults = population.map((set) => {
-      const baseScore = setScore(set, scores, N, diag);
+      const baseScore = setScore(set, scores, N, diag, scoringLookup);
 
       // Penalize sets that lack high-order relationship variety
       // Reward sets that sit in the "sweet spot" of recent transition hubs
@@ -1324,7 +1417,10 @@ function runGeneticOptimization(
 
   // Return the best of all generations
   const finalRanked = population
-    .map((set) => ({ set, score: setScore(set, scores, N, diag) }))
+    .map((set) => ({
+      set,
+      score: setScore(set, scores, N, diag, scoringLookup),
+    }))
     .sort((a, b) => b.score - a.score);
 
   return finalRanked[0].set;
@@ -1346,9 +1442,14 @@ function findHistoricalEchoes(
   const windowSize = 50;
   const echoes: number[] = [];
   const similarityScores: { index: number; score: number }[] = [];
+  const totalWindows = Math.max(0, draws.length - windowSize - 1);
+  const stride = Math.max(
+    1,
+    Math.ceil(totalWindows / Math.max(1, HISTORICAL_ECHO_MAX_WINDOWS)),
+  );
 
   // Slide through history to find statistically similar 50-draw windows
-  for (let i = 0; i < draws.length - windowSize - 1; i++) {
+  for (let i = 0; i < draws.length - windowSize - 1; i += stride) {
     const windowDraws = draws.slice(i, i + windowSize);
     const windowDiag = runFullDiagnostics(windowDraws);
 
@@ -1371,13 +1472,21 @@ function findHistoricalEchoes(
 
     if (dist < 3.0) {
       similarityScores.push({ index: i, score: dist });
+      if (similarityScores.length > HISTORICAL_ECHO_MAX_WINDOWS) {
+        similarityScores.sort((a, b) => a.score - b.score);
+        similarityScores.pop();
+      }
     }
   }
 
   similarityScores.sort((a, b) => a.score - b.score);
 
-  // Take the draw immediately after the top 3 most similar windows
-  for (let i = 0; i < Math.min(3, similarityScores.length); i++) {
+  // Take the draw immediately after the top most similar windows
+  for (
+    let i = 0;
+    i < Math.min(HISTORICAL_ECHO_TOP_MATCHES, similarityScores.length);
+    i++
+  ) {
     const nextDraw = draws[similarityScores[i].index + windowSize];
     if (nextDraw) {
       for (const n of nextDraw.numbers) {

@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "verify:logic": "tsc -p tsconfig.verify.json && powershell -NoProfile -Command \"Set-Content -Path .tmp-verify/package.json -Value '{\\\"type\\\":\\\"commonjs\\\"}'\" && node .tmp-verify/verify_logic.js"
   },
   "devDependencies": {
     "typescript": "^5.5.3",

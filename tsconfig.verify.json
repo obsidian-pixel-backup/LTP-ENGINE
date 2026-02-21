@@ -1,0 +1,9 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": ".tmp-verify",
+    "module": "CommonJS"
+  },
+  "include": ["src/analysis.ts", "src/predictor.ts", "src/verify_logic.ts"]
+}

@@ -753,7 +753,7 @@ class LottoViewer {
         </span>
       </div>
       <div style="margin-top: 1rem; font-size: 0.75rem; color: var(--text-muted); font-style: italic;">
-        * Predictions validated against all 7 winning numbers (Main + Bonus).
+        * Backtest overlap is scored against the 6 main winning numbers only (bonus excluded).
       </div>
     `;
   }
