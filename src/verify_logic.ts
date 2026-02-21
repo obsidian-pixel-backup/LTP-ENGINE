@@ -2,6 +2,7 @@ import {
   runPrediction,
   bayesianSmoothed,
   compositeScoring,
+  createDiagnosticsCache,
   WEIGHT_PROFILES,
 } from "./predictor";
 import { K, runFullDiagnostics, DrawRecord } from "./analysis";
@@ -103,10 +104,48 @@ function testPredictionDeterminism() {
   );
 }
 
+function testDiagnosticsCacheKeyUniqueness() {
+  const base = buildSyntheticDraws(41);
+  const alt = base.map((draw) => ({
+    date: draw.date,
+    numbers: [...draw.numbers],
+    bonus: draw.bonus,
+  }));
+
+  for (let i = 1; i < alt.length; i += 2) {
+    const tail = 7 + (i % 46); // 7..52
+    const numbers = [1, 2, 3, 4, 5, tail];
+    let bonus = tail + 1;
+    if (bonus > 52 || numbers.includes(bonus)) bonus = 52;
+    if (numbers.includes(bonus)) bonus = 6;
+    alt[i] = {
+      ...alt[i],
+      numbers,
+      bonus,
+    };
+  }
+
+  const cache = createDiagnosticsCache(32);
+  const baseDiag = cache.get(base);
+  const cachedAltDiag = cache.get(alt);
+  const directAltDiag = runFullDiagnostics(alt);
+
+  assert(
+    baseDiag !== cachedAltDiag,
+    "Diagnostics cache returned the same entry for different draw histories.",
+  );
+  assert(
+    Math.abs(cachedAltDiag.chiSquare.chiSquare - directAltDiag.chiSquare.chiSquare) <
+      1e-12,
+    "Diagnostics cache returned stale diagnostics for a new history.",
+  );
+}
+
 function runVerificationSuite() {
   testBayesianRecencyWeighting();
   testCompositeScoreOrdering();
   testPredictionDeterminism();
+  testDiagnosticsCacheKeyUniqueness();
 }
 
 try {

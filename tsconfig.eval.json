@@ -1,0 +1,9 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": ".tmp-eval",
+    "module": "CommonJS"
+  },
+  "include": ["src/analysis.ts", "src/predictor.ts", "src/evaluate_model.ts"]
+}

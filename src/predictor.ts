@@ -15,12 +15,151 @@ import {
   runFullDiagnostics,
 } from "./analysis";
 
-const MONTE_CARLO_MIN_TRIALS = 4000;
-const MONTE_CARLO_MAX_TRIALS = 20000;
-const BACKTEST_DIAGNOSTICS_REFRESH_EVERY = 5;
-const HISTORICAL_ECHO_MAX_DRAWS = 320;
-const HISTORICAL_ECHO_MAX_WINDOWS = 120;
-const HISTORICAL_ECHO_TOP_MATCHES = 3;
+const BASE_MONTE_CARLO_MIN_TRIALS = 2000;
+const BASE_MONTE_CARLO_MAX_TRIALS = 10000;
+const BASE_BACKTEST_REFRESH_EVERY = 8;
+const BASE_HISTORICAL_ECHO_MAX_DRAWS = 320;
+const BASE_HISTORICAL_ECHO_MAX_WINDOWS = 120;
+const BASE_HISTORICAL_ECHO_TOP_MATCHES = 3;
+const BASE_GENETIC_GENERATIONS = 45;
+const BASE_GENETIC_POPULATION = 120;
+const DEFAULT_TARGET_LATENCY_MS = 1400;
+
+export interface RuntimeBudgets {
+  monteCarloMinTrials: number;
+  monteCarloMaxTrials: number;
+  geneticGenerations: number;
+  geneticPopulation: number;
+  backtestRefreshEvery: number;
+  historicalEchoMaxDraws: number;
+  historicalEchoMaxWindows: number;
+  historicalEchoTopMatches: number;
+}
+
+export interface RuntimeBudgetOptions {
+  fastMode?: boolean;
+  targetLatencyMs?: number;
+}
+
+export function calibrateRuntimeBudgets(
+  drawCount: number,
+  options: RuntimeBudgetOptions = {},
+): RuntimeBudgets {
+  const fastMode = options.fastMode ?? false;
+  const safeDrawCount = Math.max(1, drawCount);
+  const latencyScale = Math.max(
+    0.65,
+    Math.min(1.35, (options.targetLatencyMs || DEFAULT_TARGET_LATENCY_MS) / DEFAULT_TARGET_LATENCY_MS),
+  );
+
+  let sizeScale = 1;
+  if (safeDrawCount <= 160) sizeScale = 1.2;
+  else if (safeDrawCount <= 320) sizeScale = 1;
+  else if (safeDrawCount <= 480) sizeScale = 0.82;
+  else sizeScale = 0.65;
+
+  const modeScale = fastMode ? 0.38 : 1;
+  const combinedScale = sizeScale * modeScale * latencyScale;
+
+  const monteCarloMinTrials = Math.max(
+    250,
+    Math.round(BASE_MONTE_CARLO_MIN_TRIALS * combinedScale),
+  );
+  const monteCarloMaxTrials = Math.max(
+    monteCarloMinTrials + 800,
+    Math.round(BASE_MONTE_CARLO_MAX_TRIALS * combinedScale),
+  );
+
+  const geneticGenerations = Math.max(
+    10,
+    Math.round(BASE_GENETIC_GENERATIONS * combinedScale),
+  );
+  const geneticPopulation = Math.max(
+    36,
+    Math.round(BASE_GENETIC_POPULATION * combinedScale),
+  );
+
+  const backtestRefreshEvery = fastMode
+    ? Math.max(
+        6,
+        Math.round(
+          BASE_BACKTEST_REFRESH_EVERY + safeDrawCount / 200,
+        ),
+      )
+    : Math.max(
+        5,
+        Math.round(
+          BASE_BACKTEST_REFRESH_EVERY + safeDrawCount / 280,
+        ),
+      );
+
+  const historicalEchoMaxDraws = Math.max(
+    180,
+    Math.round(BASE_HISTORICAL_ECHO_MAX_DRAWS * (fastMode ? 0.7 : sizeScale)),
+  );
+  const historicalEchoMaxWindows = Math.max(
+    28,
+    Math.round(BASE_HISTORICAL_ECHO_MAX_WINDOWS * (fastMode ? 0.6 : sizeScale)),
+  );
+  const historicalEchoTopMatches = fastMode
+    ? Math.max(2, BASE_HISTORICAL_ECHO_TOP_MATCHES - 1)
+    : BASE_HISTORICAL_ECHO_TOP_MATCHES;
+
+  return {
+    monteCarloMinTrials,
+    monteCarloMaxTrials,
+    geneticGenerations,
+    geneticPopulation,
+    backtestRefreshEvery,
+    historicalEchoMaxDraws,
+    historicalEchoMaxWindows,
+    historicalEchoTopMatches,
+  };
+}
+
+function drawStateSignature(draws: DrawRecord[]): string {
+  if (draws.length === 0) return "0";
+  // Use the full chronological draw sequence to avoid cache-key collisions.
+  return draws
+    .map((draw) => `${draw.date}:${draw.numbers.join("-")}:${draw.bonus}`)
+    .join("|");
+}
+
+export interface DiagnosticsCache {
+  get: (draws: DrawRecord[]) => FullDiagnostics;
+  clear: () => void;
+}
+
+export function createDiagnosticsCache(maxEntries = 128): DiagnosticsCache {
+  const limit = Math.max(8, maxEntries);
+  const store = new Map<string, FullDiagnostics>();
+  const order: string[] = [];
+
+  const get = (draws: DrawRecord[]): FullDiagnostics => {
+    const key = drawStateSignature(draws);
+    const cached = store.get(key);
+    if (cached) return cached;
+
+    const diagnostics = runFullDiagnostics(draws);
+    store.set(key, diagnostics);
+    order.push(key);
+
+    while (order.length > limit) {
+      const oldest = order.shift();
+      if (!oldest) break;
+      store.delete(oldest);
+    }
+
+    return diagnostics;
+  };
+
+  const clear = () => {
+    store.clear();
+    order.length = 0;
+  };
+
+  return { get, clear };
+}
 
 function hashStringToSeed(value: string): number {
   let hash = 2166136261;
@@ -54,6 +193,11 @@ interface TransitionLookup {
   lag1HighConfidenceTargetsByFrom: Map<number, Set<number>>;
 }
 
+const LAG1_MIN_SUPPORT = 2;
+const LAG1_MAX_CONFIDENCE_TARGETS = 3;
+const LAG1_CONFIDENCE_FLOOR = 0.02;
+const LAG1_CONFIDENCE_RELATIVE = 0.75;
+
 function buildTransitionLookup(transitions: TransitionEntry[]): TransitionLookup {
   const transitionByLagFrom = new Map<string, TransitionEntry>();
   const lag1TransitionByFrom = new Map<number, TransitionEntry>();
@@ -66,11 +210,24 @@ function buildTransitionLookup(transitions: TransitionEntry[]): TransitionLookup
     );
     if (transition.lag === 1) {
       lag1TransitionByFrom.set(transition.fromNumber, transition);
+      const sortedTargets = [...transition.toNumbers].sort(
+        (a, b) => b.probability - a.probability || b.count - a.count,
+      );
+      const maxProbability = sortedTargets[0]?.probability ?? 0;
+      const confidenceThreshold = Math.max(
+        LAG1_CONFIDENCE_FLOOR,
+        maxProbability * LAG1_CONFIDENCE_RELATIVE,
+      );
       lag1HighConfidenceTargetsByFrom.set(
         transition.fromNumber,
         new Set(
-          transition.toNumbers
-            .filter((to) => to.probability > 0.3)
+          sortedTargets
+            .filter(
+              (to) =>
+                to.count >= LAG1_MIN_SUPPORT &&
+                to.probability >= confidenceThreshold,
+            )
+            .slice(0, LAG1_MAX_CONFIDENCE_TARGETS)
             .map((to) => to.number),
         ),
       );
@@ -237,6 +394,82 @@ export const WEIGHT_PROFILES: WeightProfile[] = [
   },
 ];
 
+interface AdaptiveSignalScale {
+  bayesian: number;
+  hotCold: number;
+  gap: number;
+  pair: number;
+  triple: number;
+  positional: number;
+  transition: number;
+  repeat: number;
+}
+
+function deriveAdaptiveSignalScale(
+  diagnostics: FullDiagnostics,
+): AdaptiveSignalScale {
+  const entropy = diagnostics.entropy || {
+    normalizedEntropy: 1,
+    concentration: 0,
+    entropyTrend: 0,
+    rollingEntropy: [],
+    windowSize: 0,
+    regime: "neutral" as const,
+  };
+  const clamp = (value: number, min: number, max: number) =>
+    Math.max(min, Math.min(max, value));
+
+  const structureStrength = clamp(
+    (1 - entropy.normalizedEntropy) * 2.2 +
+      entropy.concentration * 0.85 -
+      Math.max(0, entropy.entropyTrend) * 1.4,
+    0,
+    1,
+  );
+  const diffuseStrength = clamp(
+    (entropy.normalizedEntropy - 0.94) * 3.2 +
+      (0.08 - entropy.concentration) * 3.4 +
+      Math.max(0, entropy.entropyTrend) * 1.6,
+    0,
+    1,
+  );
+
+  const scales: AdaptiveSignalScale = {
+    bayesian: 1 + diffuseStrength * 0.18 - structureStrength * 0.08,
+    hotCold: 1 + structureStrength * 0.22 - diffuseStrength * 0.1,
+    gap: 1 + structureStrength * 0.18 - diffuseStrength * 0.06,
+    pair: 1 + structureStrength * 0.34 - diffuseStrength * 0.32,
+    triple: 1 + structureStrength * 0.38 - diffuseStrength * 0.34,
+    positional: 1 + diffuseStrength * 0.08 - structureStrength * 0.05,
+    transition: 1 + structureStrength * 0.42 - diffuseStrength * 0.35,
+    repeat: 1 + structureStrength * 0.14 - diffuseStrength * 0.08,
+  };
+
+  if (entropy.regime === "structured") {
+    scales.pair += 0.08;
+    scales.triple += 0.1;
+    scales.transition += 0.1;
+    scales.hotCold += 0.05;
+  } else if (entropy.regime === "diffuse") {
+    scales.bayesian += 0.08;
+    scales.positional += 0.04;
+    scales.pair -= 0.08;
+    scales.triple -= 0.1;
+    scales.transition -= 0.1;
+  }
+
+  return {
+    bayesian: clamp(scales.bayesian, 0.65, 1.4),
+    hotCold: clamp(scales.hotCold, 0.7, 1.45),
+    gap: clamp(scales.gap, 0.7, 1.35),
+    pair: clamp(scales.pair, 0.55, 1.55),
+    triple: clamp(scales.triple, 0.5, 1.65),
+    positional: clamp(scales.positional, 0.75, 1.25),
+    transition: clamp(scales.transition, 0.5, 1.7),
+    repeat: clamp(scales.repeat, 0.7, 1.35),
+  };
+}
+
 export function compositeScoring(
   diagnostics: FullDiagnostics,
   draws: DrawRecord[],
@@ -373,17 +606,18 @@ export function compositeScoring(
 
   // Weights for composite
   const W = profile;
+  const signalScale = deriveAdaptiveSignalScale(diagnostics);
 
   for (const s of scores) {
     s.compositeScore =
-      (W.bayesian || 0) * filterNoise(s.bayesianScore) +
-      (W.hotCold || 0) * filterNoise(s.hotColdScore) +
-      (W.gap || 0) * filterNoise(s.gapScore) +
-      (W.pair || 0) * filterNoise(s.pairAffinityScore) +
-      (W.triple || 0) * filterNoise(s.tripleAffinityScore) +
-      (W.positional || 0) * s.positionalScore +
-      (W.transition || 0) * filterNoise(s.transitionScore) +
-      (W.repeat || 0) * s.repeatNumberScore;
+      (W.bayesian || 0) * signalScale.bayesian * filterNoise(s.bayesianScore) +
+      (W.hotCold || 0) * signalScale.hotCold * filterNoise(s.hotColdScore) +
+      (W.gap || 0) * signalScale.gap * filterNoise(s.gapScore) +
+      (W.pair || 0) * signalScale.pair * filterNoise(s.pairAffinityScore) +
+      (W.triple || 0) * signalScale.triple * filterNoise(s.tripleAffinityScore) +
+      (W.positional || 0) * signalScale.positional * s.positionalScore +
+      (W.transition || 0) * signalScale.transition * filterNoise(s.transitionScore) +
+      (W.repeat || 0) * signalScale.repeat * s.repeatNumberScore;
   }
 
   scores.sort((a, b) => b.compositeScore - a.compositeScore);
@@ -397,6 +631,16 @@ export interface PredictedSet {
   groupBreakdown: string;
   relativeLift: number;
   method: string;
+}
+
+export interface GenerateCandidateOptions {
+  fastMode?: boolean;
+  includeMonteCarlo?: boolean;
+  includeGenetic?: boolean;
+  includeSlidingWindow?: boolean;
+  includeHistoricalEcho?: boolean;
+  runtimeBudgets?: RuntimeBudgets;
+  diagnosticsCache?: DiagnosticsCache;
 }
 
 function getGroupBreakdown(nums: number[], N: number): string {
@@ -443,8 +687,17 @@ function computeBalancePenalty(nums: number[], N: number): number {
 
 interface ScoringLookup extends TransitionLookup {
   scoreByNumber: Map<number, NumberScore>;
+  transitionScoreByNumber: Map<number, number>;
   groupPatternPercentageByBreakdown: Map<string, number>;
   deltaPercentageByValue: Map<number, number>;
+  tripleWeightByKey: Map<string, number>;
+  quadrupleWeightByKey: Map<string, number>;
+  quintetWeightByKey: Map<string, number>;
+  relationshipNodeSet: Set<number>;
+}
+
+function comboKey(values: number[]): string {
+  return values.join(",");
 }
 
 function createScoringLookup(
@@ -452,17 +705,59 @@ function createScoringLookup(
   diag: FullDiagnostics,
 ): ScoringLookup {
   const scoreByNumber = new Map(scores.map((score) => [score.number, score]));
+  const transitionScoreByNumber = new Map(
+    scores.map((score) => [score.number, score.transitionScore]),
+  );
   const groupPatternPercentageByBreakdown = new Map(
     diag.groupPatterns.map((pattern) => [pattern.pattern, pattern.percentage]),
   );
   const deltaPercentageByValue = new Map(
     diag.deltas.map((delta) => [delta.delta, delta.percentage]),
   );
+  const tripleWeightByKey = new Map<string, number>();
+  const quadrupleWeightByKey = new Map<string, number>();
+  const quintetWeightByKey = new Map<string, number>();
+  const relationshipNodeSet = new Set<number>();
+
+  for (const t of diag.topTriples) {
+    const key = comboKey([t.i, t.j, t.k]);
+    tripleWeightByKey.set(key, (tripleWeightByKey.get(key) || 0) + Math.pow(1.5, 1));
+    relationshipNodeSet.add(t.i);
+    relationshipNodeSet.add(t.j);
+    relationshipNodeSet.add(t.k);
+  }
+
+  for (const q of diag.topQuadruples) {
+    const key = comboKey([q.i, q.j, q.k, q.l]);
+    quadrupleWeightByKey.set(
+      key,
+      (quadrupleWeightByKey.get(key) || 0) + Math.pow(1.5, 2),
+    );
+    relationshipNodeSet.add(q.i);
+    relationshipNodeSet.add(q.j);
+    relationshipNodeSet.add(q.k);
+    relationshipNodeSet.add(q.l);
+  }
+
+  if (diag.topQuintets) {
+    for (const q of diag.topQuintets) {
+      const key = comboKey([q.i, q.j, q.k, q.l, q.m]);
+      quintetWeightByKey.set(
+        key,
+        (quintetWeightByKey.get(key) || 0) + Math.pow(1.5, 3),
+      );
+    }
+  }
 
   return {
     scoreByNumber,
+    transitionScoreByNumber,
     groupPatternPercentageByBreakdown,
     deltaPercentageByValue,
+    tripleWeightByKey,
+    quadrupleWeightByKey,
+    quintetWeightByKey,
+    relationshipNodeSet,
     ...buildTransitionLookup(diag.transitions),
   };
 }
@@ -471,65 +766,80 @@ function setScore(
   nums: number[],
   scores: NumberScore[],
   N: number,
-  diag: FullDiagnostics,
-  lookup: ScoringLookup = createScoringLookup(scores, diag),
+  _diag: FullDiagnostics,
+  lookup: ScoringLookup = createScoringLookup(scores, _diag),
 ): number {
-  const numSet = new Set(nums);
+  const sortedNums = [...nums].sort((a, b) => a - b);
 
-  const compositeSum = nums.reduce(
+  const compositeSum = sortedNums.reduce(
     (sum, n) => sum + (lookup.scoreByNumber.get(n)?.compositeScore || 0),
     0,
   );
 
-  const groupBonus = computeGroupBalanceScore(nums, N) * 0.1;
+  const groupBonus = computeGroupBalanceScore(sortedNums, N) * 0.1;
 
   // Pattern Bonus: favor patterns that appear in history
-  const breakdown = getGroupBreakdown(nums, N);
+  const breakdown = getGroupBreakdown(sortedNums, N);
   const patternPct =
     lookup.groupPatternPercentageByBreakdown.get(breakdown) || 0;
   const patternBonus = (patternPct / 100) * 1.5;
 
-  // Relationship Bonus: EXPONENTIAL scaling for high-order clusters
+  // Relationship Bonus: use pre-indexed combination lookups.
   let relationshipBonus = 0;
-  for (const t of diag.topTriples) {
-    if (numSet.has(t.i) && numSet.has(t.j) && numSet.has(t.k)) {
-      relationshipBonus += Math.pow(1.5, 1); // base bonus
-    }
-  }
-  for (const q of diag.topQuadruples) {
-    if (
-      numSet.has(q.i) &&
-      numSet.has(q.j) &&
-      numSet.has(q.k) &&
-      numSet.has(q.l)
-    ) {
-      relationshipBonus += Math.pow(1.5, 2); // squared
-    }
-  }
-  if (diag.topQuintets) {
-    for (const q of diag.topQuintets) {
-      if (
-        numSet.has(q.i) &&
-        numSet.has(q.j) &&
-        numSet.has(q.k) &&
-        numSet.has(q.l) &&
-        numSet.has(q.m)
-      ) {
-        relationshipBonus += Math.pow(1.5, 3); // cubed (aggressive reward)
+  for (let i = 0; i < sortedNums.length - 2; i++) {
+    for (let j = i + 1; j < sortedNums.length - 1; j++) {
+      for (let k = j + 1; k < sortedNums.length; k++) {
+        relationshipBonus +=
+          lookup.tripleWeightByKey.get(
+            comboKey([sortedNums[i], sortedNums[j], sortedNums[k]]),
+          ) || 0;
       }
     }
   }
+  for (let i = 0; i < sortedNums.length - 3; i++) {
+    for (let j = i + 1; j < sortedNums.length - 2; j++) {
+      for (let k = j + 1; k < sortedNums.length - 1; k++) {
+        for (let l = k + 1; l < sortedNums.length; l++) {
+          relationshipBonus +=
+            lookup.quadrupleWeightByKey.get(
+              comboKey([sortedNums[i], sortedNums[j], sortedNums[k], sortedNums[l]]),
+            ) || 0;
+        }
+      }
+    }
+  }
+  if (lookup.quintetWeightByKey.size > 0) {
+    for (let i = 0; i < sortedNums.length - 4; i++) {
+      for (let j = i + 1; j < sortedNums.length - 3; j++) {
+        for (let k = j + 1; k < sortedNums.length - 2; k++) {
+          for (let l = k + 1; l < sortedNums.length - 1; l++) {
+            for (let m = l + 1; m < sortedNums.length; m++) {
+              relationshipBonus +=
+                lookup.quintetWeightByKey.get(
+                  comboKey([
+                    sortedNums[i],
+                    sortedNums[j],
+                    sortedNums[k],
+                    sortedNums[l],
+                    sortedNums[m],
+                  ]),
+                ) || 0;
+            }
+          }
+        }
+      }
+    }
+  }
+
   // Transition Bonus (Exponential)
   let transitionBonus = 0;
-  for (const n of nums) {
-    const s = lookup.scoreByNumber.get(n);
-    if (s && s.transitionScore > 0.4)
-      transitionBonus += Math.pow(s.transitionScore, 2);
+  for (const n of sortedNums) {
+    const transitionScore = lookup.transitionScoreByNumber.get(n) || 0;
+    if (transitionScore > 0.4) transitionBonus += Math.pow(transitionScore, 2);
   }
 
   // PHASE 5: Chain Link Bonus (favor sequences that follow a known path)
   let chainBonus = 0;
-  const sortedNums = [...nums].sort((a, b) => a - b);
   // Real implementation: check if any pairs in 'nums' match a transition pair in diag.transitions
   // This is a high-order signal for "3-hit" potential
   for (let i = 0; i < sortedNums.length; i++) {
@@ -545,35 +855,25 @@ function setScore(
 
   // Delta Penalty: discourage sets with deltas that are very rare
   let deltaPenalty = 0;
-  const sorted = [...nums].sort((a, b) => a - b);
-  for (let i = 0; i < sorted.length - 1; i++) {
-    const d = sorted[i + 1] - sorted[i];
+  for (let i = 0; i < sortedNums.length - 1; i++) {
+    const d = sortedNums[i + 1] - sortedNums[i];
     const deltaPct = lookup.deltaPercentageByValue.get(d);
     if (!deltaPct || deltaPct < 1.0) deltaPenalty += 0.3;
   }
 
-  // PHASE 7: Match Density Reward
-  // Identify how many numbers in the set are 'Anchored' by high-order relationships
-  const relationshipNodes = new Set<number>();
-  for (const t of diag.topTriples) {
-    if (numSet.has(t.i)) relationshipNodes.add(t.i);
-    if (numSet.has(t.j)) relationshipNodes.add(t.j);
-    if (numSet.has(t.k)) relationshipNodes.add(t.k);
-  }
-  for (const q of diag.topQuadruples) {
-    if (numSet.has(q.i)) relationshipNodes.add(q.i);
-    if (numSet.has(q.j)) relationshipNodes.add(q.j);
-    if (numSet.has(q.k)) relationshipNodes.add(q.k);
-    if (numSet.has(q.l)) relationshipNodes.add(q.l);
+  // PHASE 7: Match Density Reward (pre-indexed relationship nodes)
+  let relationshipNodeCount = 0;
+  for (const n of sortedNums) {
+    if (lookup.relationshipNodeSet.has(n)) relationshipNodeCount++;
   }
 
   // Reward density: if more than 3 numbers are part of validated clusters, it's a high-probability set
   let densityBonus = 0;
-  if (relationshipNodes.size >= 3) densityBonus += 2.0;
-  if (relationshipNodes.size >= 4) densityBonus += 3.0;
-  if (relationshipNodes.size >= 5) densityBonus += 5.0;
+  if (relationshipNodeCount >= 3) densityBonus += 2.0;
+  if (relationshipNodeCount >= 4) densityBonus += 3.0;
+  if (relationshipNodeCount >= 5) densityBonus += 5.0;
 
-  const balancePenalty = computeBalancePenalty(nums, N) * 2.0;
+  const balancePenalty = computeBalancePenalty(sortedNums, N) * 2.0;
 
   return (
     compositeSum +
@@ -594,16 +894,32 @@ export function generateCandidateSets(
   draws: DrawRecord[],
   numSets: number = 10,
   rng: () => number = Math.random,
+  options: GenerateCandidateOptions = {},
 ): PredictedSet[] {
   const N = diagnostics.poolSize;
   const candidates: PredictedSet[] = [];
   const scoringLookup = createScoringLookup(scores, diagnostics);
+  const setScoreCache = new Map<string, number>();
+  const fastMode = options.fastMode ?? false;
+  const runtimeBudgets =
+    options.runtimeBudgets ||
+    calibrateRuntimeBudgets(draws.length, { fastMode });
+  const includeMonteCarlo = options.includeMonteCarlo ?? !fastMode;
+  const includeGenetic = options.includeGenetic ?? !fastMode;
+  const includeSlidingWindow = options.includeSlidingWindow ?? !fastMode;
+  const includeHistoricalEcho = options.includeHistoricalEcho ?? !fastMode;
 
   const addSet = (nums: number[], method: string) => {
     const sorted = nums.slice(0, K).sort((a, b) => a - b);
+    const key = sorted.join(",");
+    let totalScore = setScoreCache.get(key);
+    if (totalScore === undefined) {
+      totalScore = setScore(sorted, scores, N, diagnostics, scoringLookup);
+      setScoreCache.set(key, totalScore);
+    }
     candidates.push({
       numbers: sorted,
-      totalScore: setScore(sorted, scores, N, diagnostics, scoringLookup),
+      totalScore,
       groupBreakdown: getGroupBreakdown(sorted, N),
       relativeLift: 0,
       method,
@@ -679,15 +995,15 @@ export function generateCandidateSets(
   }
 
   // 5. Monte Carlo Optimized (20,000 trials + Seeded Sampling)
-  {
+  if (includeMonteCarlo) {
     const totalComposite = scores.reduce((s, x) => s + x.compositeScore, 0);
     const probDist =
       totalComposite > 0
         ? scores.map((s) => s.compositeScore / totalComposite)
         : scores.map(() => 1 / Math.max(1, scores.length));
     const maxTrials = Math.min(
-      MONTE_CARLO_MAX_TRIALS,
-      Math.max(MONTE_CARLO_MIN_TRIALS, draws.length * 25),
+      runtimeBudgets.monteCarloMaxTrials,
+      Math.max(runtimeBudgets.monteCarloMinTrials, draws.length * 25),
     );
     const earlyStopPatience = Math.max(1200, Math.floor(maxTrials * 0.2));
     const minTrialsBeforeEarlyStop = Math.floor(maxTrials * 0.35);
@@ -739,7 +1055,12 @@ export function generateCandidateSets(
       const { odd } = getOddEvenSplit(set);
       if (odd === 0 || odd === 6) continue;
 
-      const score = setScore(set, scores, N, diagnostics, scoringLookup);
+      const setKey = set.join(",");
+      let score = setScoreCache.get(setKey);
+      if (score === undefined) {
+        score = setScore(set, scores, N, diagnostics, scoringLookup);
+        setScoreCache.set(setKey, score);
+      }
       if (score > bestMCScore) {
         bestMCScore = score;
         bestMC = [...set];
@@ -809,8 +1130,16 @@ export function generateCandidateSets(
   }
 
   // 7. Genetic Jackpot Optimizer (Elite evolution)
-  {
-    const gaResult = runGeneticOptimization(scores, diagnostics, rng);
+  if (includeGenetic) {
+    const gaResult = runGeneticOptimization(
+      scores,
+      diagnostics,
+      rng,
+      runtimeBudgets.geneticGenerations,
+      runtimeBudgets.geneticPopulation,
+      setScoreCache,
+      scoringLookup,
+    );
     addSet(gaResult, "Jackpot Target");
   }
 
@@ -898,7 +1227,7 @@ export function generateCandidateSets(
   }
 
   // 10. Sliding Window (picks blocks of high-scoring numbers)
-  {
+  if (includeSlidingWindow) {
     for (let i = 0; i <= scores.length - K; i++) {
       const combo = scores.slice(i, i + K).map((s) => s.number);
       addSet(combo, "Sliding Window High");
@@ -955,8 +1284,15 @@ export function generateCandidateSets(
   }
 
   // 8. Historical Echo (numbers from eras with similar statistical profiles)
-  if (draws.length <= HISTORICAL_ECHO_MAX_DRAWS) {
-    const echoes = findHistoricalEchoes(scores, diagnostics, draws);
+  // Run on full history; internal stride/runtime budgets keep this bounded.
+  if (includeHistoricalEcho) {
+    const echoes = findHistoricalEchoes(
+      scores,
+      diagnostics,
+      draws,
+      runtimeBudgets,
+      options.diagnosticsCache,
+    );
     if (echoes.length >= K) {
       addSet(echoes.slice(0, K), "Historical Echo");
     }
@@ -986,7 +1322,42 @@ export function generateCandidateSets(
 }
 
 // ─── Backtesting ────────────────────────────────────────────────────
+export interface BacktestRowDetail {
+  date: string;
+  actual: number[];
+  bonus: number;
+  predictedTop6: number[];
+  overlap: number;
+  firstAttemptTop6?: number[];
+  firstAttemptOverlap?: number;
+  attemptsUsed?: number;
+  mastered?: boolean;
+}
+
+export interface PredictionLiveTrace {
+  phase: "mastery_attempt" | "backtest_row";
+  sequenceIndex: number;
+  sequenceTotal: number;
+  date: string;
+  actual: number[];
+  bonus: number;
+  predicted: number[];
+  overlap: number;
+  bestOverlap?: number;
+  attemptsUsed?: number;
+  attemptCap?: number | null;
+  profileName?: string;
+}
+
+export interface MethodPerformanceSnapshot {
+  name: string;
+  avgOverlap: number;
+  hitRate: number;
+  samples: number;
+}
+
 export interface BacktestResult {
+  mode: "standard" | "mastery";
   trainSize: number;
   testSize: number;
   modelHits: number;
@@ -994,17 +1365,13 @@ export interface BacktestResult {
   modelHitRate: number;
   improvement: number;
   top6Overlap: number;
-  rowDetails: Array<{
-    date: string;
-    actual: number[];
-    predictedTop6: number[];
-    overlap: number;
-  }>;
+  rowDetails: BacktestRowDetail[];
   profilePerformance: Array<{
     name: string;
     overlap: number;
     rollingHistory?: number[];
   }>;
+  methodPerformance?: MethodPerformanceSnapshot[];
   finalDiagnostics: FullDiagnostics;
   finalBestProfile: WeightProfile;
   learningTrend: number; // Percentage change (Last 50 vs First 50)
@@ -1012,56 +1379,391 @@ export interface BacktestResult {
   recentMatches: number; // Avg matches in last 50
   fourPlusHits: number;
   fourPlusRate: number;
+  maxObservedOverlap: number;
+  sixMatchHits: number;
+  sixMatchRate: number;
+  warmStartApplied?: boolean;
+  warmStartProfileName?: string;
+  forwardOnlyModelHits?: number;
+  forwardOnlyModelHitRate?: number;
+  forwardOnlyTop6Overlap?: number;
+  forwardOnlyFourPlusHits?: number;
+  forwardOnlyFourPlusRate?: number;
+  forwardOnlySixMatchHits?: number;
+  forwardOnlySixMatchRate?: number;
+  masteryTargetMatch?: number;
+  masteryTotalAttempts?: number;
+  masterySolvedSequences?: number;
+  masteryUnresolvedSequences?: number;
+  masteryFirstAttemptSolved?: number;
+  masteryAverageAttempts?: number;
+  masteryGlobalCapReached?: boolean;
+}
+
+function clampUnit(value: number): number {
+  if (Number.isNaN(value) || !Number.isFinite(value)) return 0;
+  if (value < 0) return 0;
+  if (value > 1) return 1;
+  return value;
 }
 
 function matchUtility(overlap: number): number {
-  if (overlap >= 5) return overlap + 8;
-  if (overlap >= 4) return overlap + 4;
+  if (overlap >= 6) return overlap + 26;
+  if (overlap >= 5) return overlap + 11;
+  if (overlap >= 4) return overlap + 5;
   if (overlap === 3) return overlap + 1;
   return overlap;
+}
+
+function buildSevenTargetSet(draw: DrawRecord): Set<number> {
+  const target = new Set<number>();
+  for (const n of draw.numbers) {
+    if (n > 0) target.add(n);
+  }
+  if (draw.bonus > 0) {
+    target.add(draw.bonus);
+  }
+  return target;
+}
+
+function selectSequenceFocusedTopSet(
+  candidates: PredictedSet[],
+  scores: NumberScore[],
+): number[] {
+  const fallback = scores
+    .slice(0, K)
+    .map((score) => score.number)
+    .sort((a, b) => a - b);
+  if (candidates.length === 0) return fallback;
+
+  const numberWeight = new Map<number, number>();
+  const maxComposite = Math.max(...scores.map((score) => score.compositeScore));
+  const minComposite = Math.min(...scores.map((score) => score.compositeScore));
+  const scoreRange = Math.max(1e-9, maxComposite - minComposite);
+
+  const candidateLimit = Math.min(10, candidates.length);
+  for (let idx = 0; idx < candidateLimit; idx++) {
+    const candidate = candidates[idx];
+    const rankWeight = 1 / (idx + 1);
+    const liftWeight = clampNumber(candidate.relativeLift || 1, 0.35, 1.75);
+    const methodBoost =
+      candidate.method.includes("Consensus") || candidate.method.includes("Jackpot")
+        ? 1.15
+        : 1;
+    const candidateWeight = rankWeight * liftWeight * methodBoost;
+    for (const n of candidate.numbers) {
+      numberWeight.set(n, (numberWeight.get(n) || 0) + candidateWeight);
+    }
+  }
+
+  for (const score of scores) {
+    const compositeNorm = (score.compositeScore - minComposite) / scoreRange;
+    const transitionBonus = Math.max(0, score.transitionScore) * 0.35;
+    const structureBonus = Math.max(0, score.tripleAffinityScore) * 0.25;
+    const priorWeight = compositeNorm * 0.8 + transitionBonus + structureBonus;
+    numberWeight.set(score.number, (numberWeight.get(score.number) || 0) + priorWeight);
+  }
+
+  const ranked = Array.from(numberWeight.entries())
+    .sort((a, b) => b[1] - a[1] || a[0] - b[0])
+    .map(([number]) => number);
+
+  const topSet: number[] = [];
+  for (const number of ranked) {
+    if (topSet.length >= K) break;
+    if (!topSet.includes(number)) topSet.push(number);
+  }
+  for (const score of scores) {
+    if (topSet.length >= K) break;
+    if (!topSet.includes(score.number)) topSet.push(score.number);
+  }
+
+  return topSet.slice(0, K).sort((a, b) => a - b);
+}
+
+function prependConsensusSet(
+  sets: PredictedSet[],
+  scores: NumberScore[],
+  N: number,
+  diag: FullDiagnostics,
+): PredictedSet[] {
+  if (sets.length === 0) return sets;
+
+  const consensus = selectSequenceFocusedTopSet(sets, scores);
+  const consensusKey = consensus.join(",");
+  const existing = sets.find((set) => set.numbers.join(",") === consensusKey);
+  const ordered = existing
+    ? [existing, ...sets.filter((set) => set !== existing)]
+    : [
+        {
+          numbers: consensus,
+          // Keep scoring scale consistent with all generated methods.
+          totalScore: setScore(consensus, scores, N, diag),
+          groupBreakdown: getGroupBreakdown(consensus, N),
+          relativeLift: 0,
+          method: "Sequence Consensus",
+        },
+        ...sets,
+      ].slice(0, sets.length);
+
+  const ranked = [...ordered].sort((a, b) => b.totalScore - a.totalScore);
+  const bestScore = Math.max(...ranked.map((set) => set.totalScore), 1e-9);
+  return ranked.map((set) => ({
+    ...set,
+    relativeLift: bestScore > 0 ? set.totalScore / bestScore : 1,
+  }));
+}
+
+function rerankSetsWithMethodPerformance(
+  sets: PredictedSet[],
+  methodPerformance: MethodPerformanceSnapshot[] | undefined,
+): PredictedSet[] {
+  if (sets.length === 0) return sets;
+  const statsByMethod = new Map(
+    (methodPerformance || []).map((snapshot) => [snapshot.name, snapshot]),
+  );
+  const methodAverages = (methodPerformance || []).map(
+    (snapshot) => snapshot.avgOverlap,
+  );
+  const minMethodAvg =
+    methodAverages.length > 0 ? Math.min(...methodAverages) : 0;
+  const maxMethodAvg =
+    methodAverages.length > 0 ? Math.max(...methodAverages) : 1;
+  const methodRange = Math.max(1e-9, maxMethodAvg - minMethodAvg);
+
+  const rawScores = sets.map((set) => set.totalScore);
+  const minScore = Math.min(...rawScores);
+  const maxScore = Math.max(...rawScores);
+  const scoreRange = Math.max(1e-9, maxScore - minScore);
+
+  // Cross-set agreement: numbers repeatedly selected by high-ranked sets
+  // are generally more stable than single-method outliers.
+  const bestLift = Math.max(
+    ...sets.map((set) => (Number.isFinite(set.relativeLift) ? set.relativeLift : 0)),
+    1e-9,
+  );
+  const numberSupport = new Map<number, number>();
+  for (let idx = 0; idx < sets.length; idx++) {
+    const set = sets[idx];
+    const rankWeight = 1 / (idx + 1);
+    const liftWeight = clampNumber(
+      (Number.isFinite(set.relativeLift) ? set.relativeLift : 0) / bestLift,
+      0,
+      1.25,
+    );
+    const setWeight = rankWeight * 0.55 + liftWeight * 0.45;
+    for (const n of set.numbers) {
+      numberSupport.set(n, (numberSupport.get(n) || 0) + setWeight);
+    }
+  }
+
+  const supportScores = sets.map((set) =>
+    set.numbers.reduce((sum, n) => sum + (numberSupport.get(n) || 0), 0) / K,
+  );
+  const minSupport = Math.min(...supportScores);
+  const maxSupport = Math.max(...supportScores);
+  const supportRange = Math.max(1e-9, maxSupport - minSupport);
+
+  const ranked = sets
+    .map((set, idx) => {
+      const scoreNorm = (set.totalScore - minScore) / scoreRange;
+      const methodStats = statsByMethod.get(set.method);
+      const methodNorm = methodStats
+        ? (methodStats.avgOverlap - minMethodAvg) / methodRange
+        : 0.5;
+      const methodConfidence = methodStats
+        ? clampNumber(methodStats.samples / 24, 0.25, 1)
+        : 0.25;
+      const reliability = methodNorm * methodConfidence + 0.5 * (1 - methodConfidence);
+      const rankPrior = 1 - idx / Math.max(1, sets.length - 1);
+      const supportNorm = (supportScores[idx] - minSupport) / supportRange;
+
+      // Blend raw score, cross-set support, and method reliability.
+      const utility =
+        scoreNorm * 0.44 +
+        supportNorm * 0.34 +
+        reliability * 0.18 +
+        rankPrior * 0.04;
+      return {
+        ...set,
+        totalScore: utility,
+      };
+    })
+    .sort((a, b) => b.totalScore - a.totalScore);
+
+  const bestUtility = Math.max(...ranked.map((set) => set.totalScore), 1e-9);
+  return ranked.map((set) => ({
+    ...set,
+    relativeLift: bestUtility > 0 ? set.totalScore / bestUtility : 1,
+  }));
 }
 
 export function backtest(
   draws: DrawRecord[],
   N: number,
   trainRatio = 0.8, // Updated to 80/20 as requested
+  onProgress?: (progress: number, stage: string) => void,
+  runtimeBudgets: RuntimeBudgets = calibrateRuntimeBudgets(draws.length, {
+    fastMode: true,
+  }),
+  diagnosticsCache: DiagnosticsCache = createDiagnosticsCache(192),
+  seedSalt = "",
+  settings: ModelSettings = {},
+  onTrace?: (trace: PredictionLiveTrace) => void,
 ): BacktestResult {
+  const emitProgress = (progress: number, stage: string) => {
+    if (!onProgress) return;
+    onProgress(clampUnit(progress), stage);
+  };
+
+  const masteryBacktestMode = settings.masteryBacktestMode === true;
+  const masteryTargetMatch = Math.round(
+    clampNumber(settings.targetSequenceMatch ?? 6, 1, 6),
+  );
+  const masteryMaxAttemptsPerSequenceRaw = settings.masteryMaxAttemptsPerSequence;
+  const masteryMaxAttemptsPerSequence =
+    masteryMaxAttemptsPerSequenceRaw !== undefined &&
+    masteryMaxAttemptsPerSequenceRaw > 0
+      ? Math.round(clampNumber(masteryMaxAttemptsPerSequenceRaw, 1, 2000))
+      : Number.POSITIVE_INFINITY;
+  const masteryGlobalAttemptCapRaw = settings.masteryGlobalAttemptCap;
+  const masteryGlobalAttemptCap =
+    masteryGlobalAttemptCapRaw !== undefined && masteryGlobalAttemptCapRaw > 0
+      ? Math.round(clampNumber(masteryGlobalAttemptCapRaw, 1, 1_000_000))
+      : Number.POSITIVE_INFINITY;
+  const masteryProgressEveryAttempts = Math.max(
+    1,
+    Math.round(clampNumber(settings.masteryProgressEveryAttempts ?? 8, 1, 1000)),
+  );
+  const masteryMaxAttemptsPerSequenceEffective = Number.isFinite(
+    masteryMaxAttemptsPerSequence,
+  )
+    ? masteryMaxAttemptsPerSequence
+    : 5000;
+  const masteryGlobalAttemptCapEffective = Number.isFinite(
+    masteryGlobalAttemptCap,
+  )
+    ? masteryGlobalAttemptCap
+    : 250000;
+  const warmStartEnabled = settings.warmStartEnabled === true;
+  const warmStartProfile =
+    warmStartEnabled && settings.warmStartProfile
+      ? sanitizeWeightProfile(settings.warmStartProfile, WEIGHT_PROFILES[0])
+      : null;
+  const warmProfileOverlaps = settings.warmProfileOverlaps || {};
+
+  emitProgress(0.02, "Initializing backtest");
+
   if (draws.length < 2) {
-    const diagnostics = runFullDiagnostics(draws);
+    const diagnostics = diagnosticsCache.get(draws);
+    emitProgress(1, "Backtest complete");
     return {
+      mode: masteryBacktestMode ? "mastery" : "standard",
       trainSize: draws.length,
       testSize: 0,
       modelHits: 0,
-      baselineHitRate: K / N,
+      baselineHitRate: (K + 1) / N,
       modelHitRate: 0,
       improvement: 0,
       top6Overlap: 0,
       rowDetails: [],
       profilePerformance: WEIGHT_PROFILES.map((p) => ({
         name: p.name,
-        overlap: 0,
+        overlap: clampNumber(
+          Number(warmProfileOverlaps[p.name] || 0),
+          0,
+          2000,
+        ),
       })),
       finalDiagnostics: diagnostics,
-      finalBestProfile: WEIGHT_PROFILES[0],
+      finalBestProfile: warmStartProfile || WEIGHT_PROFILES[0],
       learningTrend: 0,
       earlyMatches: 0,
       recentMatches: 0,
       fourPlusHits: 0,
       fourPlusRate: 0,
+      maxObservedOverlap: 0,
+      sixMatchHits: 0,
+      sixMatchRate: 0,
+      warmStartApplied: warmStartProfile !== null,
+      warmStartProfileName: warmStartProfile?.name,
+      forwardOnlyModelHits: masteryBacktestMode ? 0 : undefined,
+      forwardOnlyModelHitRate: masteryBacktestMode ? 0 : undefined,
+      forwardOnlyTop6Overlap: masteryBacktestMode ? 0 : undefined,
+      forwardOnlyFourPlusHits: masteryBacktestMode ? 0 : undefined,
+      forwardOnlyFourPlusRate: masteryBacktestMode ? 0 : undefined,
+      forwardOnlySixMatchHits: masteryBacktestMode ? 0 : undefined,
+      forwardOnlySixMatchRate: masteryBacktestMode ? 0 : undefined,
+      masteryTargetMatch: masteryBacktestMode ? masteryTargetMatch : undefined,
+      masteryTotalAttempts: masteryBacktestMode ? 0 : undefined,
+      masterySolvedSequences: masteryBacktestMode ? 0 : undefined,
+      masteryUnresolvedSequences: masteryBacktestMode ? 0 : undefined,
+      masteryFirstAttemptSolved: masteryBacktestMode ? 0 : undefined,
+      masteryAverageAttempts: masteryBacktestMode ? 0 : undefined,
+      masteryGlobalCapReached: masteryBacktestMode ? false : undefined,
     };
   }
 
   const splitIdx = Math.floor(draws.length * trainRatio);
   const trainDraws = draws.slice(0, splitIdx);
   const testDraws = draws.slice(splitIdx);
+  const fastCandidateOptions: GenerateCandidateOptions = {
+    fastMode: true,
+    includeMonteCarlo: false,
+    includeGenetic: false,
+    includeSlidingWindow: false,
+    includeHistoricalEcho: false,
+    runtimeBudgets,
+    diagnosticsCache,
+  };
+  const masteryCandidateBaseOptions: GenerateCandidateOptions = {
+    fastMode: settings.fastMode ?? false,
+    includeMonteCarlo: settings.includeMonteCarlo ?? true,
+    includeGenetic: settings.includeGenetic ?? true,
+    includeSlidingWindow: settings.includeSlidingWindow ?? true,
+    includeHistoricalEcho: settings.includeHistoricalEcho ?? true,
+    runtimeBudgets,
+    diagnosticsCache,
+  };
+  const buildMasteryBudgets = (attempt: number): RuntimeBudgets => {
+    const boostStage = Math.min(10, Math.floor(Math.max(0, attempt - 1) / 6));
+    return {
+      ...runtimeBudgets,
+      monteCarloMinTrials: Math.round(
+        clampNumber(
+          runtimeBudgets.monteCarloMinTrials + boostStage * 350,
+          100,
+          120_000,
+        ),
+      ),
+      monteCarloMaxTrials: Math.round(
+        clampNumber(
+          runtimeBudgets.monteCarloMaxTrials + boostStage * 1400,
+          500,
+          200_000,
+        ),
+      ),
+      geneticGenerations: Math.round(
+        clampNumber(runtimeBudgets.geneticGenerations + boostStage * 3, 5, 320),
+      ),
+      geneticPopulation: Math.round(
+        clampNumber(runtimeBudgets.geneticPopulation + boostStage * 10, 20, 1500),
+      ),
+      backtestRefreshEvery: runtimeBudgets.backtestRefreshEvery,
+      historicalEchoMaxDraws: runtimeBudgets.historicalEchoMaxDraws,
+      historicalEchoMaxWindows: runtimeBudgets.historicalEchoMaxWindows,
+      historicalEchoTopMatches: runtimeBudgets.historicalEchoTopMatches,
+    };
+  };
 
   // Initial training: find best starting profile
-  let currentDiagnostics = runFullDiagnostics(trainDraws);
-  let bestProfile = WEIGHT_PROFILES[0];
+  emitProgress(0.08, "Building initial diagnostics");
+  let currentDiagnostics = diagnosticsCache.get(trainDraws);
+  let bestProfile = warmStartProfile || WEIGHT_PROFILES[0];
   let bestProfileOverlap = -1;
   const profilePerformance = WEIGHT_PROFILES.map((p) => ({
     name: p.name,
-    overlap: 0,
+    overlap: clampNumber(Number(warmProfileOverlaps[p.name] || 0), 0, 2000),
     rollingHistory: [] as number[],
   }));
 
@@ -1072,95 +1774,427 @@ export function backtest(
   const valTest = trainDraws.slice(valStart);
 
   if (valTrain.length > 50) {
-    const valDiag = runFullDiagnostics(valTrain);
-    for (const profile of WEIGHT_PROFILES) {
-      const s = compositeScoring(valDiag, valTrain, profile);
-      const seededValRng = createSeededRandom(
-        hashStringToSeed(`val:${profile.name}:${valTrain.length}`),
-      );
-      const valSet = generateCandidateSets(
-        s,
-        valDiag,
-        valTrain,
-        1,
-        seededValRng,
-      )[0]?.numbers;
-      const t6 = new Set(valSet ?? s.slice(0, K).map((x) => x.number));
+    for (let profileIdx = 0; profileIdx < WEIGHT_PROFILES.length; profileIdx++) {
+      const profile = WEIGHT_PROFILES[profileIdx];
+      const profileValHistory = [...valTrain];
+      let profileValDiagnostics = diagnosticsCache.get(profileValHistory);
       let o = 0;
-      for (const d of valTest) {
-        const overlap = d.numbers.filter((n) => t6.has(n)).length;
+
+      for (let valIdx = 0; valIdx < valTest.length; valIdx++) {
+        const d = valTest[valIdx];
+        const s = compositeScoring(profileValDiagnostics, profileValHistory, profile);
+        const seededValRng = createSeededRandom(
+          hashStringToSeed(
+            `val:${profile.name}:${profileValHistory.length}:${d.date}:${seedSalt}`,
+          ),
+        );
+        const valCandidates = generateCandidateSets(
+          s,
+          profileValDiagnostics,
+          profileValHistory,
+          12,
+          seededValRng,
+          fastCandidateOptions,
+        );
+        const valSet = selectSequenceFocusedTopSet(valCandidates, s);
+        const t6 = new Set(valSet);
+        const targetSet = buildSevenTargetSet(d);
+        const overlap = Array.from(t6).filter((n) => targetSet.has(n)).length;
         o += matchUtility(overlap);
+
+        profileValHistory.push(d);
+        const shouldRefresh =
+          valIdx === valTest.length - 1 ||
+          (valIdx + 1) % runtimeBudgets.backtestRefreshEvery === 0;
+        if (shouldRefresh) {
+          profileValDiagnostics = diagnosticsCache.get(profileValHistory);
+        }
       }
       if (o > bestProfileOverlap) {
         bestProfileOverlap = o;
         bestProfile = profile;
       }
+
+      emitProgress(
+        0.12 + ((profileIdx + 1) / WEIGHT_PROFILES.length) * 0.08,
+        `Validating profile ${profileIdx + 1}/${WEIGHT_PROFILES.length}`,
+      );
     }
+    if (warmStartProfile) {
+      bestProfile = blendWeightProfiles(
+        "Warm Hybrid",
+        warmStartProfile,
+        bestProfile,
+        0.65,
+      );
+    }
+  } else {
+    emitProgress(0.2, "Validation skipped (insufficient train window)");
   }
 
   let hits = 0;
   let fourPlusHits = 0;
+  let sixMatchHits = 0;
   let top6TotalOverlap = 0;
-  const rowDetails: Array<{
-    date: string;
-    actual: number[];
-    predictedTop6: number[];
-    overlap: number;
-  }> = [];
+  let forwardOnlyHits = 0;
+  let forwardOnlyFourPlusHits = 0;
+  let forwardOnlySixMatchHits = 0;
+  let forwardOnlyTop6TotalOverlap = 0;
+  const rowDetails: BacktestRowDetail[] = [];
+  const methodPerformanceMap = new Map<
+    string,
+    { overlapTotal: number; hitCount: number; samples: number }
+  >();
+  const recordMethodOverlap = (method: string, overlap: number) => {
+    const key = method.trim();
+    if (!key) return;
+    const existing = methodPerformanceMap.get(key);
+    if (existing) {
+      existing.overlapTotal += overlap;
+      existing.samples += 1;
+      if (overlap > 0) existing.hitCount += 1;
+      return;
+    }
+    methodPerformanceMap.set(key, {
+      overlapTotal: overlap,
+      hitCount: overlap > 0 ? 1 : 0,
+      samples: 1,
+    });
+  };
+  let masteryTotalAttempts = 0;
+  let masterySolvedSequences = 0;
+  let masteryFirstAttemptSolved = 0;
+  let masteryGlobalCapReached = false;
 
   // Iterative Learning Loop: for each test draw, predict -> validate -> learn
   const history = [...trainDraws];
   const rollingWindow = 50;
+  const progressInterval = Math.max(1, Math.floor(testDraws.length / 40));
 
   for (let testIdx = 0; testIdx < testDraws.length; testIdx++) {
-    const testDraw = testDraws[testIdx];
-    // 1. Predict using current best profile and latest diagnostics
-    const currentScores = compositeScoring(
-      currentDiagnostics,
-      history,
-      bestProfile,
-    );
-    const drawSeed = `${testDraw.date}:${history.length}:${bestProfile.name}`;
-    const drawRng = createSeededRandom(hashStringToSeed(drawSeed));
-    const bestSet = generateCandidateSets(
-      currentScores,
-      currentDiagnostics,
-      history,
-      1,
-      drawRng,
-    )[0]?.numbers;
-    const top6 = new Set(bestSet ?? currentScores.slice(0, K).map((s) => s.number));
+    if (
+      masteryBacktestMode &&
+      masteryTotalAttempts >= masteryGlobalAttemptCapEffective
+    ) {
+      masteryGlobalCapReached = true;
+      emitProgress(
+        0.97,
+        `Mastery attempt cap reached at sequence ${testIdx}/${testDraws.length}`,
+      );
+      break;
+    }
 
-    // 2. Validate against actual draw (main numbers only, 6-of-N objective)
+    const testDraw = testDraws[testIdx];
     const actualMain = [...testDraw.numbers].filter((n) => n > 0);
-    const t6Overlap = actualMain.filter((n) => top6.has(n)).length;
+    const actualTargetSet = buildSevenTargetSet(testDraw);
+    let selectedTop6: number[] = [];
+    let t6Overlap = 0;
+    let firstAttemptTop6: number[] | undefined = undefined;
+    let firstAttemptOverlap: number | undefined = undefined;
+    let attemptsUsed = 1;
+    let mastered = false;
+
+    if (masteryBacktestMode) {
+      let sequenceBestSet: number[] = [];
+      let sequenceBestOverlap = -1;
+      let sequenceBestProfile: WeightProfile | null = null;
+      let sequenceAttempts = 0;
+      let previousAttemptKey = "";
+      let stagnantAttempts = 0;
+      const numberMomentum = new Array(N + 1).fill(0);
+      const rankedProfiles = [...profilePerformance]
+        .sort((a, b) => b.overlap - a.overlap)
+        .slice(0, 4)
+        .map((entry) => entry.name);
+
+      while (
+        sequenceBestOverlap < masteryTargetMatch &&
+        sequenceAttempts < masteryMaxAttemptsPerSequenceEffective &&
+        masteryTotalAttempts < masteryGlobalAttemptCapEffective
+      ) {
+        const profileName = rankedProfiles[sequenceAttempts % Math.max(1, rankedProfiles.length)];
+        const tunedProfile =
+          WEIGHT_PROFILES.find((profile) => profile.name === profileName) ||
+          bestProfile;
+        const attemptSeed = `mastery:${testDraw.date}:${history.length}:${sequenceAttempts}:${seedSalt}`;
+        const attemptRng = createSeededRandom(hashStringToSeed(attemptSeed));
+        let attemptSet: number[] = [];
+        let attemptOverlap = -1;
+        const baseAttemptScores = compositeScoring(
+          currentDiagnostics,
+          history,
+          tunedProfile,
+        );
+        const jitterAmplitude = Math.max(
+          0.02,
+          0.12 - Math.min(0.08, sequenceAttempts * 0.003),
+        );
+        const adjustedScores = baseAttemptScores
+          .map((score) => ({
+            ...score,
+            compositeScore:
+              score.compositeScore +
+              numberMomentum[score.number] +
+              (attemptRng() - 0.5) * jitterAmplitude,
+          }))
+          .sort((a, b) => b.compositeScore - a.compositeScore);
+        const attemptBudgets = buildMasteryBudgets(sequenceAttempts + 1);
+        const candidateCount = Math.min(
+          24,
+          16 +
+            Math.floor(sequenceAttempts / 8) * 2 +
+            Math.min(4, stagnantAttempts),
+        );
+        const attemptCandidates = generateCandidateSets(
+          adjustedScores,
+          currentDiagnostics,
+          history,
+          candidateCount,
+          attemptRng,
+          {
+            ...masteryCandidateBaseOptions,
+            runtimeBudgets: attemptBudgets,
+          },
+        );
+        const momentumSet = adjustedScores
+          .slice(0, K)
+          .map((score) => score.number)
+          .sort((a, b) => a - b);
+        const consensusSet = selectSequenceFocusedTopSet(
+          attemptCandidates,
+          adjustedScores,
+        );
+        const candidateSetPool: number[][] = [
+          consensusSet,
+          momentumSet,
+          ...attemptCandidates
+            .slice(0, Math.min(candidateCount, 18))
+            .map((candidate) => candidate.numbers),
+        ];
+        const uniqueCandidateSets: number[][] = [];
+        const seenCandidateKeys = new Set<string>();
+        for (const candidateSet of candidateSetPool) {
+          const normalized = [...candidateSet].sort((a, b) => a - b);
+          const key = normalized.join(",");
+          if (seenCandidateKeys.has(key)) continue;
+          seenCandidateKeys.add(key);
+          uniqueCandidateSets.push(normalized);
+        }
+        const selectionIndex =
+          uniqueCandidateSets.length <= 1
+            ? 0
+            : sequenceAttempts === 0
+              ? 0
+              : Math.floor(attemptRng() * uniqueCandidateSets.length);
+        attemptSet =
+          uniqueCandidateSets[selectionIndex] ||
+          [...consensusSet].sort((a, b) => a - b);
+        attemptOverlap = attemptSet.filter((n) => actualTargetSet.has(n)).length;
+
+        sequenceAttempts++;
+        masteryTotalAttempts++;
+
+        if (sequenceAttempts === 1) {
+          firstAttemptTop6 = [...attemptSet];
+          firstAttemptOverlap = attemptOverlap;
+        }
+
+        const attemptKey = attemptSet.join(",");
+        if (attemptKey === previousAttemptKey) {
+          stagnantAttempts++;
+        } else {
+          stagnantAttempts = 0;
+          previousAttemptKey = attemptKey;
+        }
+
+        // Forward-only momentum update: reinforce numbers selected by the model.
+        for (let number = 1; number <= N; number++) {
+          numberMomentum[number] *= 0.93;
+        }
+        const scoreByNumber = new Map(
+          adjustedScores.map((score) => [score.number, score.compositeScore]),
+        );
+        for (const number of attemptSet) {
+          const modelScore = scoreByNumber.get(number) || 0;
+          numberMomentum[number] += 0.12 + Math.max(0, Math.min(0.24, modelScore * 0.09));
+        }
+        if (stagnantAttempts >= 2) {
+          for (let number = 1; number <= N; number++) {
+            numberMomentum[number] += (attemptRng() - 0.5) * 0.12;
+          }
+        }
+
+        if (attemptOverlap > sequenceBestOverlap) {
+          sequenceBestOverlap = attemptOverlap;
+          sequenceBestSet = [...attemptSet];
+          sequenceBestProfile = tunedProfile;
+        }
+
+        const shouldReportAttemptProgress =
+          sequenceAttempts === 1 ||
+          sequenceAttempts % masteryProgressEveryAttempts === 0 ||
+          attemptOverlap >= masteryTargetMatch ||
+          masteryTotalAttempts >= masteryGlobalAttemptCapEffective ||
+          sequenceAttempts >= masteryMaxAttemptsPerSequenceEffective;
+        if (shouldReportAttemptProgress) {
+          onTrace?.({
+            phase: "mastery_attempt",
+            sequenceIndex: testIdx + 1,
+            sequenceTotal: testDraws.length,
+            date: testDraw.date,
+            actual: [...actualMain].sort((a, b) => a - b),
+            bonus: testDraw.bonus,
+            predicted: [...attemptSet].sort((a, b) => a - b),
+            overlap: attemptOverlap,
+            bestOverlap: Math.max(0, sequenceBestOverlap),
+            attemptsUsed: sequenceAttempts,
+            attemptCap: Number.isFinite(masteryMaxAttemptsPerSequence)
+              ? masteryMaxAttemptsPerSequenceEffective
+              : null,
+            profileName: tunedProfile.name,
+          });
+          const withinSequenceProgress = Number.isFinite(
+            masteryMaxAttemptsPerSequence,
+          )
+            ? Math.min(
+                1,
+                sequenceAttempts /
+                  Math.max(1, masteryMaxAttemptsPerSequenceEffective),
+              )
+            : Math.min(0.98, sequenceAttempts / 25);
+          const loopProgress =
+            testDraws.length > 0
+              ? (testIdx + withinSequenceProgress) / testDraws.length
+              : 1;
+          emitProgress(
+            0.2 + loopProgress * 0.75,
+            `Mastery sequence ${testIdx + 1}/${testDraws.length} | attempt ${sequenceAttempts}${Number.isFinite(masteryMaxAttemptsPerSequence) ? `/${masteryMaxAttemptsPerSequenceEffective}` : ""} | best ${Math.max(0, sequenceBestOverlap)}/6`,
+          );
+        }
+      }
+
+      attemptsUsed = sequenceAttempts;
+      selectedTop6 = sequenceBestSet;
+      t6Overlap = Math.max(0, sequenceBestOverlap);
+      mastered = t6Overlap >= masteryTargetMatch;
+      if (mastered) masterySolvedSequences++;
+      if (mastered && sequenceAttempts === 1) masteryFirstAttemptSolved++;
+      if (sequenceBestProfile) {
+        bestProfile = sequenceBestProfile;
+      }
+      if (masteryTotalAttempts >= masteryGlobalAttemptCapEffective) {
+        masteryGlobalCapReached = true;
+      }
+
+      if (selectedTop6.length === 0) {
+        const fallbackScores = compositeScoring(
+          currentDiagnostics,
+          history,
+          bestProfile,
+        );
+        selectedTop6 = fallbackScores
+          .slice(0, K)
+          .map((score) => score.number)
+          .sort((a, b) => a - b);
+        t6Overlap = selectedTop6.filter((n) => actualTargetSet.has(n)).length;
+      }
+
+      if (!firstAttemptTop6) {
+        firstAttemptTop6 = [...selectedTop6];
+        firstAttemptOverlap = t6Overlap;
+      }
+    } else {
+      // 1. Predict using current best profile and latest diagnostics
+      const currentScores = compositeScoring(
+        currentDiagnostics,
+        history,
+        bestProfile,
+      );
+      const drawSeed = `${testDraw.date}:${history.length}:${bestProfile.name}:${seedSalt}`;
+      const drawRng = createSeededRandom(hashStringToSeed(drawSeed));
+      const bestCandidates = generateCandidateSets(
+        currentScores,
+        currentDiagnostics,
+        history,
+        12,
+        drawRng,
+        fastCandidateOptions,
+      );
+      selectedTop6 = selectSequenceFocusedTopSet(bestCandidates, currentScores);
+      t6Overlap = selectedTop6.filter((n) => actualTargetSet.has(n)).length;
+      for (const candidate of bestCandidates.slice(0, 10)) {
+        const overlap = candidate.numbers.filter((n) => actualTargetSet.has(n)).length;
+        recordMethodOverlap(candidate.method, overlap);
+      }
+      recordMethodOverlap("Sequence Consensus", t6Overlap);
+    }
+
+    const top6 = new Set(selectedTop6);
 
     if (t6Overlap > 0) hits++;
     if (t6Overlap >= 4) fourPlusHits++;
+    if (t6Overlap >= 6) sixMatchHits++;
     top6TotalOverlap += t6Overlap;
+
+    if (masteryBacktestMode) {
+      const firstOverlap = firstAttemptOverlap ?? t6Overlap;
+      forwardOnlyTop6TotalOverlap += firstOverlap;
+      if (firstOverlap > 0) forwardOnlyHits++;
+      if (firstOverlap >= 4) forwardOnlyFourPlusHits++;
+      if (firstOverlap >= 6) forwardOnlySixMatchHits++;
+    }
 
     rowDetails.push({
       date: testDraw.date,
       actual: actualMain.sort((a, b) => a - b),
+      bonus: testDraw.bonus,
       predictedTop6: Array.from(top6).sort((a, b) => a - b),
       overlap: t6Overlap,
+      firstAttemptTop6: masteryBacktestMode
+        ? [...(firstAttemptTop6 || selectedTop6)].sort((a, b) => a - b)
+        : undefined,
+      firstAttemptOverlap: masteryBacktestMode
+        ? (firstAttemptOverlap ?? t6Overlap)
+        : undefined,
+      attemptsUsed: masteryBacktestMode ? attemptsUsed : undefined,
+      mastered: masteryBacktestMode ? mastered : undefined,
+    });
+
+    onTrace?.({
+      phase: "backtest_row",
+      sequenceIndex: testIdx + 1,
+      sequenceTotal: testDraws.length,
+      date: testDraw.date,
+      actual: [...actualMain].sort((a, b) => a - b),
+      bonus: testDraw.bonus,
+      predicted: [...selectedTop6].sort((a, b) => a - b),
+      overlap: t6Overlap,
+      bestOverlap: masteryBacktestMode ? Math.max(0, t6Overlap) : undefined,
+      attemptsUsed: masteryBacktestMode ? attemptsUsed : undefined,
+      attemptCap: masteryBacktestMode
+        ? Number.isFinite(masteryMaxAttemptsPerSequence)
+          ? masteryMaxAttemptsPerSequenceEffective
+          : null
+        : undefined,
     });
 
     // 3. Reinforcement update without leakage:
     // evaluate profile predictions built from pre-outcome history only.
     WEIGHT_PROFILES.forEach((p, idx) => {
       const ps = compositeScoring(currentDiagnostics, history, p);
-      const profileSeed = `${testDraw.date}:${history.length}:${p.name}`;
+      const profileSeed = `${testDraw.date}:${history.length}:${p.name}:${seedSalt}`;
       const profileRng = createSeededRandom(hashStringToSeed(profileSeed));
-      const profileSet = generateCandidateSets(
+      const profileCandidates = generateCandidateSets(
         ps,
         currentDiagnostics,
         history,
-        1,
+        12,
         profileRng,
-      )[0]?.numbers;
-      const pt6 = new Set(profileSet ?? ps.slice(0, K).map((x) => x.number));
-      const po = actualMain.filter((n) => pt6.has(n)).length;
+        fastCandidateOptions,
+      );
+      const profileSet = selectSequenceFocusedTopSet(profileCandidates, ps);
+      const pt6 = new Set(profileSet);
+      const po = Array.from(pt6).filter((n) => actualTargetSet.has(n)).length;
 
       // Update rolling overlap (we store per-draw result and sum the last 50)
       const rh = profilePerformance[idx].rollingHistory!;
@@ -1173,9 +2207,9 @@ export function backtest(
     history.push(testDraw);
     const shouldRefreshDiagnostics =
       testIdx === testDraws.length - 1 ||
-      (testIdx + 1) % BACKTEST_DIAGNOSTICS_REFRESH_EVERY === 0;
+      (testIdx + 1) % runtimeBudgets.backtestRefreshEvery === 0;
     if (shouldRefreshDiagnostics) {
-      currentDiagnostics = runFullDiagnostics(history);
+      currentDiagnostics = diagnosticsCache.get(history);
     }
 
     // Strategy: Every 5 draws, compute a NEURAL ENSEMBLE profile (Phase 7)
@@ -1214,16 +2248,61 @@ export function backtest(
 
       bestProfile = ensembleProfile;
     }
+
+    if (
+      testIdx === testDraws.length - 1 ||
+      (testIdx + 1) % progressInterval === 0
+    ) {
+      const loopProgress =
+        testDraws.length > 0 ? (testIdx + 1) / testDraws.length : 1;
+      emitProgress(
+        0.2 + loopProgress * 0.75,
+        masteryBacktestMode
+          ? `Mastery sequence ${testIdx + 1}/${testDraws.length} | solved ${masterySolvedSequences}`
+          : `Backtesting draw ${testIdx + 1}/${testDraws.length}`,
+      );
+    }
   }
 
+  const processedTestSize = rowDetails.length;
   const avgTop6Overlap =
-    testDraws.length > 0 ? top6TotalOverlap / testDraws.length : 0;
+    processedTestSize > 0 ? top6TotalOverlap / processedTestSize : 0;
+  const forwardOnlyAvgTop6Overlap =
+    processedTestSize > 0 ? forwardOnlyTop6TotalOverlap / processedTestSize : 0;
   const modelHitRate = avgTop6Overlap / K; // Hits per prediction slot
-  const baselinePercentage = K / N; // Expected hit-rate for random 6-number pick
+  const forwardOnlyModelHitRate = forwardOnlyAvgTop6Overlap / K;
+  const baselinePercentage = (K + 1) / N; // Random baseline against a 7-ball target
+  const overlapPrior =
+    processedTestSize > 0 ? top6TotalOverlap / processedTestSize : (K + 1) / N;
+  const methodShrinkage = Math.max(
+    8,
+    Math.min(32, Math.round(processedTestSize * 0.12)),
+  );
+  const methodPerformance: MethodPerformanceSnapshot[] = Array.from(
+    methodPerformanceMap.entries(),
+  )
+    .map(([name, stats]) => {
+      const shrunkAverage =
+        (stats.overlapTotal + overlapPrior * methodShrinkage) /
+        (stats.samples + methodShrinkage);
+      return {
+        name,
+        avgOverlap: shrunkAverage,
+        hitRate: stats.samples > 0 ? stats.hitCount / stats.samples : 0,
+        samples: stats.samples,
+      };
+    })
+    .sort(
+      (a, b) =>
+        b.avgOverlap - a.avgOverlap ||
+        b.hitRate - a.hitRate ||
+        b.samples - a.samples,
+    );
 
   const result: BacktestResult = {
+    mode: masteryBacktestMode ? "mastery" : "standard",
     trainSize: trainDraws.length,
-    testSize: testDraws.length,
+    testSize: processedTestSize,
     modelHits: hits,
     baselineHitRate: baselinePercentage,
     modelHitRate: modelHitRate,
@@ -1234,16 +2313,63 @@ export function backtest(
     top6Overlap: avgTop6Overlap,
     rowDetails,
     profilePerformance,
+    methodPerformance,
     finalDiagnostics: currentDiagnostics,
     finalBestProfile: bestProfile,
     learningTrend: 0,
     earlyMatches: 0,
     recentMatches: 0,
     fourPlusHits,
-    fourPlusRate: testDraws.length > 0 ? fourPlusHits / testDraws.length : 0,
+    fourPlusRate: processedTestSize > 0 ? fourPlusHits / processedTestSize : 0,
+    maxObservedOverlap: 0,
+    sixMatchHits,
+    sixMatchRate: processedTestSize > 0 ? sixMatchHits / processedTestSize : 0,
+    warmStartApplied: warmStartProfile !== null,
+    warmStartProfileName: warmStartProfile?.name,
+    forwardOnlyModelHits: masteryBacktestMode ? forwardOnlyHits : undefined,
+    forwardOnlyModelHitRate: masteryBacktestMode
+      ? forwardOnlyModelHitRate
+      : undefined,
+    forwardOnlyTop6Overlap: masteryBacktestMode
+      ? forwardOnlyAvgTop6Overlap
+      : undefined,
+    forwardOnlyFourPlusHits: masteryBacktestMode
+      ? forwardOnlyFourPlusHits
+      : undefined,
+    forwardOnlyFourPlusRate: masteryBacktestMode
+      ? processedTestSize > 0
+        ? forwardOnlyFourPlusHits / processedTestSize
+        : 0
+      : undefined,
+    forwardOnlySixMatchHits: masteryBacktestMode
+      ? forwardOnlySixMatchHits
+      : undefined,
+    forwardOnlySixMatchRate: masteryBacktestMode
+      ? processedTestSize > 0
+        ? forwardOnlySixMatchHits / processedTestSize
+        : 0
+      : undefined,
+    masteryTargetMatch: masteryBacktestMode ? masteryTargetMatch : undefined,
+    masteryTotalAttempts: masteryBacktestMode ? masteryTotalAttempts : undefined,
+    masterySolvedSequences: masteryBacktestMode ? masterySolvedSequences : undefined,
+    masteryUnresolvedSequences: masteryBacktestMode
+      ? Math.max(0, processedTestSize - masterySolvedSequences)
+      : undefined,
+    masteryFirstAttemptSolved: masteryBacktestMode
+      ? masteryFirstAttemptSolved
+      : undefined,
+    masteryAverageAttempts: masteryBacktestMode
+      ? processedTestSize > 0
+        ? masteryTotalAttempts / processedTestSize
+        : 0
+      : undefined,
+    masteryGlobalCapReached: masteryBacktestMode
+      ? masteryGlobalCapReached
+      : undefined,
   };
 
   // PHASE 6: Calculate Learning Trend (Recent 50 vs First 50 test rows)
+  emitProgress(0.97, "Computing backtest metrics");
   const windowSize = 50;
   if (rowDetails.length >= windowSize * 2) {
     const earlyRows = rowDetails.slice(0, windowSize);
@@ -1258,6 +2384,12 @@ export function backtest(
       earlyAvg > 0 ? ((recentAvg - earlyAvg) / earlyAvg) * 100 : 0;
   }
 
+  result.maxObservedOverlap = rowDetails.reduce(
+    (maxVal, row) => Math.max(maxVal, row.overlap),
+    0,
+  );
+
+  emitProgress(1, "Backtest complete");
   return result;
 }
 
@@ -1270,49 +2402,308 @@ export interface PredictionOutput {
   warning: string;
 }
 
-const MAX_PREDICTION_WINDOW_DRAWS = 450;
+export interface PredictionRunOptions {
+  onProgress?: (progress: number, stage: string) => void;
+  onTrace?: (trace: PredictionLiveTrace) => void;
+  settings?: ModelSettings;
+}
 
-export function runPrediction(
-  draws: DrawRecord[],
+export interface ModelSettings {
+  trainRatio?: number;
+  fastMode?: boolean;
+  targetLatencyMs?: number;
+  backtestRefreshEvery?: number;
+  includeMonteCarlo?: boolean;
+  includeGenetic?: boolean;
+  includeHistoricalEcho?: boolean;
+  includeSlidingWindow?: boolean;
+  monteCarloMinTrials?: number;
+  monteCarloMaxTrials?: number;
+  geneticGenerations?: number;
+  geneticPopulation?: number;
+  continuousTraining?: boolean;
+  targetSequenceMatch?: number;
+  maxOptimizationRounds?: number;
+  masteryBacktestMode?: boolean;
+  masteryMaxAttemptsPerSequence?: number;
+  masteryGlobalAttemptCap?: number;
+  masteryProgressEveryAttempts?: number;
+  warmStartEnabled?: boolean;
+  warmStartProfile?: WeightProfile;
+  warmProfileOverlaps?: Record<string, number>;
+  randomSeedSalt?: string;
+}
+
+interface WeightedProfile {
+  profile: WeightProfile;
+  weight: number;
+}
+
+interface FinalPredictionArtifacts {
+  sets: PredictedSet[];
+  scores: NumberScore[];
+  bayesian: BayesianResult[];
+  warning: string;
+}
+
+interface FinalPredictionBuildOptions {
+  draws: DrawRecord[];
+  diagnostics: FullDiagnostics;
+  backtest: BacktestResult;
+  modelSettings: ModelSettings;
+  runtimeBudgets: RuntimeBudgets;
+  diagnosticsCache: DiagnosticsCache;
+  seedSalt: string;
+  refreshMode?: boolean;
+  onProgress?: (progress: number, stage: string) => void;
+}
+
+function clampNumber(value: number, min: number, max: number): number {
+  if (!Number.isFinite(value)) return min;
+  if (value < min) return min;
+  if (value > max) return max;
+  return value;
+}
+
+function sanitizeWeightProfile(
+  raw: WeightProfile | undefined,
+  fallback: WeightProfile,
+  defaultName = "Warm Start",
+): WeightProfile {
+  if (!raw) return { ...fallback };
+  const keys: Array<keyof WeightProfile> = [
+    "bayesian",
+    "hotCold",
+    "gap",
+    "pair",
+    "triple",
+    "positional",
+    "transition",
+    "repeat",
+  ];
+  const values = keys.map((key) =>
+    clampNumber(Number(raw[key] || 0), 0, 1.5),
+  );
+  const sum = values.reduce((acc, value) => acc + value, 0);
+  if (sum <= 0) return { ...fallback };
+
+  const normalized = values.map((value) => value / sum);
+  const name =
+    typeof raw.name === "string" && raw.name.trim().length > 0
+      ? raw.name
+      : defaultName;
+  return {
+    name,
+    bayesian: normalized[0],
+    hotCold: normalized[1],
+    gap: normalized[2],
+    pair: normalized[3],
+    triple: normalized[4],
+    positional: normalized[5],
+    transition: normalized[6],
+    repeat: normalized[7],
+  };
+}
+
+function blendWeightProfiles(
+  name: string,
+  primary: WeightProfile,
+  secondary: WeightProfile,
+  primaryWeight: number,
+): WeightProfile {
+  const wPrimary = clampNumber(primaryWeight, 0, 1);
+  const wSecondary = 1 - wPrimary;
+  return sanitizeWeightProfile(
+    {
+      name,
+      bayesian: primary.bayesian * wPrimary + secondary.bayesian * wSecondary,
+      hotCold: primary.hotCold * wPrimary + secondary.hotCold * wSecondary,
+      gap: primary.gap * wPrimary + secondary.gap * wSecondary,
+      pair: primary.pair * wPrimary + secondary.pair * wSecondary,
+      triple: primary.triple * wPrimary + secondary.triple * wSecondary,
+      positional:
+        primary.positional * wPrimary + secondary.positional * wSecondary,
+      transition:
+        primary.transition * wPrimary + secondary.transition * wSecondary,
+      repeat: primary.repeat * wPrimary + secondary.repeat * wSecondary,
+    },
+    secondary,
+    name,
+  );
+}
+
+function applyModelSettingsToBudgets(
+  budgets: RuntimeBudgets,
+  settings: ModelSettings,
+): RuntimeBudgets {
+  const tuned = { ...budgets };
+
+  if (settings.monteCarloMinTrials !== undefined) {
+    tuned.monteCarloMinTrials = Math.round(
+      clampNumber(settings.monteCarloMinTrials, 100, 100000),
+    );
+  }
+  if (settings.monteCarloMaxTrials !== undefined) {
+    tuned.monteCarloMaxTrials = Math.round(
+      clampNumber(settings.monteCarloMaxTrials, 500, 200000),
+    );
+  }
+  if (tuned.monteCarloMaxTrials < tuned.monteCarloMinTrials) {
+    tuned.monteCarloMaxTrials = tuned.monteCarloMinTrials;
+  }
+
+  if (settings.geneticGenerations !== undefined) {
+    tuned.geneticGenerations = Math.round(
+      clampNumber(settings.geneticGenerations, 5, 250),
+    );
+  }
+  if (settings.geneticPopulation !== undefined) {
+    tuned.geneticPopulation = Math.round(
+      clampNumber(settings.geneticPopulation, 20, 1000),
+    );
+  }
+  if (settings.backtestRefreshEvery !== undefined) {
+    tuned.backtestRefreshEvery = Math.round(
+      clampNumber(settings.backtestRefreshEvery, 2, 40),
+    );
+  }
+
+  return tuned;
+}
+
+function blendCompositeScores(
   diagnostics: FullDiagnostics,
-): PredictionOutput {
-  const N = diagnostics.poolSize;
+  draws: DrawRecord[],
+  weightedProfiles: WeightedProfile[],
+  onProfileScored?: (profileIndex: number, totalProfiles: number) => void,
+): NumberScore[] {
+  if (weightedProfiles.length === 0) {
+    return compositeScoring(diagnostics, draws, WEIGHT_PROFILES[0]);
+  }
 
-  // Keep prediction latency stable on large uploads.
-  // A smaller rolling window still captures recent behavior while preventing
-  // expensive O(n²) backtest loops from locking up the UI.
-  const targetWindow = MAX_PREDICTION_WINDOW_DRAWS;
-  const startIndex = Math.max(0, draws.length - targetWindow);
-  // PHASE 5: Enforce chronological order (Oldest -> Newest) for correct learning direction
-  const eraDraws = draws.slice(startIndex).sort((a, b) => {
-    return new Date(a.date).getTime() - new Date(b.date).getTime();
-  });
+  const snapshots: Array<{
+    weight: number;
+    scores: NumberScore[];
+  }> = [];
 
-  // PHASE 5: Run backtest FIRST to "warm up" the model through online learning
-  const bt = backtest(eraDraws, N);
-  const seedBase = eraDraws
+  for (let i = 0; i < weightedProfiles.length; i++) {
+    const entry = weightedProfiles[i];
+    snapshots.push({
+      weight: Math.max(0.0001, entry.weight),
+      scores: compositeScoring(diagnostics, draws, entry.profile),
+    });
+    onProfileScored?.(i, weightedProfiles.length);
+  }
+
+  const template = snapshots[0].scores.map((score) => ({ ...score, compositeScore: 0 }));
+  const templateByNumber = new Map(template.map((score) => [score.number, score]));
+  const totalWeight =
+    snapshots.reduce((sum, snapshot) => sum + snapshot.weight, 0) || 1;
+
+  for (const snapshot of snapshots) {
+    for (const score of snapshot.scores) {
+      const target = templateByNumber.get(score.number);
+      if (!target) continue;
+      target.compositeScore += score.compositeScore * snapshot.weight;
+    }
+  }
+
+  for (const score of template) {
+    score.compositeScore /= totalWeight;
+  }
+
+  template.sort((a, b) => b.compositeScore - a.compositeScore);
+  return template;
+}
+
+function buildFinalPredictionArtifacts(
+  options: FinalPredictionBuildOptions,
+): FinalPredictionArtifacts {
+  const emitProgress = (progress: number, stage: string) => {
+    options.onProgress?.(clampUnit(progress), stage);
+  };
+
+  emitProgress(0.05, "Selecting optimized profile");
+  const seedBase = options.draws
     .slice(-50)
     .map((d) => `${d.date}:${d.numbers.join("-")}:${d.bonus}`)
-    .join("|");
+    .join(
+      options.refreshMode
+        ? `|refresh:${Date.now()}|salt:${options.seedSalt}|`
+        : `|salt:${options.seedSalt}|`,
+    );
   const rng = createSeededRandom(hashStringToSeed(seedBase));
 
-  // Use the learned state for the final next-draw prediction
-  const learnedProfile = bt.finalBestProfile;
-  const learnedDiagnostics = bt.finalDiagnostics;
+  const learnedProfile = options.backtest.finalBestProfile;
+  const learnedDiagnostics = options.backtest.finalDiagnostics;
 
-  const finalScores = compositeScoring(
-    learnedDiagnostics,
-    eraDraws,
-    learnedProfile,
+  const profileByName = new Map(
+    WEIGHT_PROFILES.map((profile) => [profile.name, profile]),
   );
+  const weightedProfileMap = new Map<string, WeightedProfile>();
+  const addWeightedProfile = (profile: WeightProfile, weight: number) => {
+    const key = profile.name;
+    const existing = weightedProfileMap.get(key);
+    if (existing) {
+      existing.weight += weight;
+      return;
+    }
+    weightedProfileMap.set(key, { profile, weight });
+  };
+
+  addWeightedProfile(learnedProfile, 2.25);
+  const rankedProfiles = [...options.backtest.profilePerformance]
+    .sort((a, b) => b.overlap - a.overlap)
+    .slice(0, 4);
+  for (const ranked of rankedProfiles) {
+    const profile = profileByName.get(ranked.name);
+    if (!profile) continue;
+    addWeightedProfile(profile, Math.max(1, ranked.overlap) + 0.75);
+  }
+  const weightedProfiles = Array.from(weightedProfileMap.values());
+
+  emitProgress(0.28, "Scoring candidate numbers");
+  const finalScores = blendCompositeScores(
+    learnedDiagnostics,
+    options.draws,
+    weightedProfiles,
+    (profileIndex, totalProfiles) => {
+      const progress = totalProfiles > 0 ? (profileIndex + 1) / totalProfiles : 1;
+      emitProgress(
+        0.28 + progress * 0.2,
+        `Scoring ensemble profile ${profileIndex + 1}/${totalProfiles}`,
+      );
+    },
+  );
+  emitProgress(0.5, "Generating candidate sets");
   const sets = generateCandidateSets(
     finalScores,
     learnedDiagnostics,
-    eraDraws,
-    10,
+    options.draws,
+    14,
     rng,
+    {
+      fastMode: options.modelSettings.fastMode,
+      includeMonteCarlo: options.modelSettings.includeMonteCarlo,
+      includeGenetic: options.modelSettings.includeGenetic,
+      includeHistoricalEcho: options.modelSettings.includeHistoricalEcho,
+      includeSlidingWindow: options.modelSettings.includeSlidingWindow,
+      runtimeBudgets: options.runtimeBudgets,
+      diagnosticsCache: options.diagnosticsCache,
+    },
   );
-  const bays = bayesianSmoothed(eraDraws, N);
+  const rankedSets = prependConsensusSet(
+    sets,
+    finalScores,
+    options.diagnostics.poolSize,
+    learnedDiagnostics,
+  );
+  const finalizedSets = rerankSetsWithMethodPerformance(
+    rankedSets,
+    options.backtest.methodPerformance,
+  ).slice(0, 10);
+  emitProgress(0.84, "Computing Bayesian summary");
+  const bays = bayesianSmoothed(options.draws, options.diagnostics.poolSize);
 
   let warning: string;
   if (!learnedDiagnostics.biasDetected) {
@@ -1327,7 +2718,154 @@ export function runPrediction(
       "Play responsibly.";
   }
 
-  return { sets, backtest: bt, scores: finalScores, bayesian: bays, warning };
+  if (options.refreshMode) {
+    warning =
+      "Candidate refresh completed using current trained state (no full retrain). " +
+      warning;
+  }
+
+  emitProgress(1, options.refreshMode ? "Candidate refresh complete" : "Prediction complete");
+  return {
+    sets: finalizedSets,
+    scores: finalScores,
+    bayesian: bays,
+    warning,
+  };
+}
+
+export function runPrediction(
+  draws: DrawRecord[],
+  diagnostics: FullDiagnostics,
+  options: PredictionRunOptions = {},
+): PredictionOutput {
+  const emitProgress = (progress: number, stage: string) => {
+    options.onProgress?.(clampUnit(progress), stage);
+  };
+
+  emitProgress(0.02, "Preparing training window");
+  const N = diagnostics.poolSize;
+  const modelSettings = options.settings || {};
+  const seedSalt =
+    modelSettings.randomSeedSalt !== undefined
+      ? String(modelSettings.randomSeedSalt)
+      : "";
+  const trainRatio =
+    modelSettings.trainRatio !== undefined
+      ? clampNumber(modelSettings.trainRatio, 0.5, 0.95)
+      : 0.8;
+
+  // Use the full uploaded history in chronological order for training/prediction.
+  const eraDraws = [...draws].sort((a, b) => a.date.localeCompare(b.date));
+  const calibratedBudgets = calibrateRuntimeBudgets(eraDraws.length, {
+    fastMode: modelSettings.fastMode,
+    targetLatencyMs: modelSettings.targetLatencyMs,
+  });
+  const runtimeBudgets = applyModelSettingsToBudgets(
+    calibratedBudgets,
+    modelSettings,
+  );
+  const diagnosticsCache = createDiagnosticsCache(220);
+
+  // PHASE 5: Run backtest FIRST to "warm up" the model through online learning
+  emitProgress(0.08, "Running adaptive backtest");
+  const bt = backtest(
+    eraDraws,
+    N,
+    trainRatio,
+    (progress, stage) => {
+      emitProgress(0.08 + progress * 0.72, stage);
+    },
+    runtimeBudgets,
+    diagnosticsCache,
+    seedSalt,
+    modelSettings,
+    options.onTrace,
+  );
+  const finalArtifacts = buildFinalPredictionArtifacts({
+    draws: eraDraws,
+    diagnostics,
+    backtest: bt,
+    modelSettings,
+    runtimeBudgets,
+    diagnosticsCache,
+    seedSalt,
+    onProgress: (progress, stage) => {
+      emitProgress(0.82 + progress * 0.18, stage);
+    },
+  });
+
+  return {
+    sets: finalArtifacts.sets,
+    backtest: bt,
+    scores: finalArtifacts.scores,
+    bayesian: finalArtifacts.bayesian,
+    warning: finalArtifacts.warning,
+  };
+}
+
+export interface PredictionRefreshRunOptions {
+  onProgress?: (progress: number, stage: string) => void;
+  settings?: ModelSettings;
+  basePrediction: PredictionOutput;
+}
+
+export function refreshPredictionCandidates(
+  draws: DrawRecord[],
+  diagnostics: FullDiagnostics,
+  options: PredictionRefreshRunOptions,
+): PredictionOutput {
+  const emitProgress = (progress: number, stage: string) => {
+    options.onProgress?.(clampUnit(progress), stage);
+  };
+
+  emitProgress(0.03, "Preparing candidate refresh");
+  const modelSettings = options.settings || {};
+  const seedSalt =
+    modelSettings.randomSeedSalt !== undefined
+      ? String(modelSettings.randomSeedSalt)
+      : "";
+  const eraDraws = [...draws].sort((a, b) => a.date.localeCompare(b.date));
+  const calibratedBudgets = calibrateRuntimeBudgets(eraDraws.length, {
+    fastMode: modelSettings.fastMode,
+    targetLatencyMs: modelSettings.targetLatencyMs,
+  });
+  const runtimeBudgets = applyModelSettingsToBudgets(
+    calibratedBudgets,
+    modelSettings,
+  );
+  const diagnosticsCache = createDiagnosticsCache(120);
+  const baseBacktest = options.basePrediction.backtest;
+
+  const reusedDiagnostics =
+    baseBacktest.finalDiagnostics.poolSize === diagnostics.poolSize
+      ? baseBacktest.finalDiagnostics
+      : diagnostics;
+  const refreshedBacktest: BacktestResult = {
+    ...baseBacktest,
+    finalDiagnostics: reusedDiagnostics,
+  };
+
+  const finalArtifacts = buildFinalPredictionArtifacts({
+    draws: eraDraws,
+    diagnostics: reusedDiagnostics,
+    backtest: refreshedBacktest,
+    modelSettings,
+    runtimeBudgets,
+    diagnosticsCache,
+    seedSalt: `${seedSalt}|refresh`,
+    refreshMode: true,
+    onProgress: (progress, stage) => {
+      emitProgress(0.08 + progress * 0.9, stage);
+    },
+  });
+
+  return {
+    sets: finalArtifacts.sets,
+    backtest: refreshedBacktest,
+    scores: finalArtifacts.scores,
+    bayesian: finalArtifacts.bayesian,
+    warning: finalArtifacts.warning,
+  };
 }
 
 // ─── Genetic Algorithm Optimization ─────────────────────────────────
@@ -1335,19 +2873,29 @@ function runGeneticOptimization(
   scores: NumberScore[],
   diag: FullDiagnostics,
   rng: () => number,
-  generations = 100,
-  popSize = 250,
+  generations = BASE_GENETIC_GENERATIONS,
+  popSize = BASE_GENETIC_POPULATION,
+  setScoreCache: Map<string, number> = new Map(),
+  scoringLookup: ScoringLookup = createScoringLookup(scores, diag),
 ): number[] {
   const N = diag.poolSize;
   const topN = 24; // Compress search space to top 24 numbers
   const numPool = scores.slice(0, topN).map((s) => s.number);
-  const scoringLookup = createScoringLookup(scores, diag);
+  const scoreSet = (set: number[]): number => {
+    const sorted = [...set].sort((a, b) => a - b);
+    const key = sorted.join(",");
+    const cached = setScoreCache.get(key);
+    if (cached !== undefined) return cached;
+    const score = setScore(sorted, scores, N, diag, scoringLookup);
+    setScoreCache.set(key, score);
+    return score;
+  };
 
   // Initial Population
   let population: number[][] = [];
   for (let i = 0; i < popSize; i++) {
-      const set: number[] = [];
-      while (set.length < K) {
+    const set: number[] = [];
+    while (set.length < K) {
       const n = numPool[Math.floor(rng() * numPool.length)];
       if (!set.includes(n)) set.push(n);
     }
@@ -1358,7 +2906,7 @@ function runGeneticOptimization(
     // 1. Fitness Calculation
     // PHASE 7: Aggressively target "Match Density" (high overlap probability)
     const fitnessResults = population.map((set) => {
-      const baseScore = setScore(set, scores, N, diag, scoringLookup);
+      const baseScore = scoreSet(set);
 
       // Penalize sets that lack high-order relationship variety
       // Reward sets that sit in the "sweet spot" of recent transition hubs
@@ -1419,7 +2967,7 @@ function runGeneticOptimization(
   const finalRanked = population
     .map((set) => ({
       set,
-      score: setScore(set, scores, N, diag, scoringLookup),
+      score: scoreSet(set),
     }))
     .sort((a, b) => b.score - a.score);
 
@@ -1431,6 +2979,8 @@ function findHistoricalEchoes(
   scores: NumberScore[],
   diag: FullDiagnostics,
   draws: DrawRecord[],
+  runtimeBudgets: RuntimeBudgets = calibrateRuntimeBudgets(draws.length),
+  diagnosticsCache: DiagnosticsCache = createDiagnosticsCache(96),
 ): number[] {
   const currentProfile = {
     chi: diag.chiSquare.chiSquare,
@@ -1445,13 +2995,13 @@ function findHistoricalEchoes(
   const totalWindows = Math.max(0, draws.length - windowSize - 1);
   const stride = Math.max(
     1,
-    Math.ceil(totalWindows / Math.max(1, HISTORICAL_ECHO_MAX_WINDOWS)),
+    Math.ceil(totalWindows / Math.max(1, runtimeBudgets.historicalEchoMaxWindows)),
   );
 
   // Slide through history to find statistically similar 50-draw windows
   for (let i = 0; i < draws.length - windowSize - 1; i += stride) {
     const windowDraws = draws.slice(i, i + windowSize);
-    const windowDiag = runFullDiagnostics(windowDraws);
+    const windowDiag = diagnosticsCache.get(windowDraws);
 
     if (windowDiag.poolSize !== diag.poolSize) continue;
 
@@ -1472,7 +3022,7 @@ function findHistoricalEchoes(
 
     if (dist < 3.0) {
       similarityScores.push({ index: i, score: dist });
-      if (similarityScores.length > HISTORICAL_ECHO_MAX_WINDOWS) {
+      if (similarityScores.length > runtimeBudgets.historicalEchoMaxWindows) {
         similarityScores.sort((a, b) => a.score - b.score);
         similarityScores.pop();
       }
@@ -1484,7 +3034,7 @@ function findHistoricalEchoes(
   // Take the draw immediately after the top most similar windows
   for (
     let i = 0;
-    i < Math.min(HISTORICAL_ECHO_TOP_MATCHES, similarityScores.length);
+    i < Math.min(runtimeBudgets.historicalEchoTopMatches, similarityScores.length);
     i++
   ) {
     const nextDraw = draws[similarityScores[i].index + windowSize];

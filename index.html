@@ -25,9 +25,14 @@
           <section id="controls" class="glass">
             <div class="control-group file-upload-group">
               <label for="fileInput" class="btn primary"
-                >Upload Excel File</label
+                >Upload Data File</label
               >
-              <input type="file" id="fileInput" accept=".xlsx, .xls" hidden />
+              <input
+                type="file"
+                id="fileInput"
+                accept=".xlsx, .xls, .csv, .txt"
+                hidden
+              />
               <span id="fileNameDisplay">No file selected</span>
             </div>
 
@@ -177,6 +182,14 @@
           </section>
 
           <section id="tableContainer" class="glass">
+            <div class="table-actions">
+              <div id="tableStats" class="table-stats">
+                Imported: 0 rows | Valid draws: 0 | Showing: 0
+              </div>
+              <button id="exportCsvBtn" class="btn secondary small-btn" disabled>
+                Export Visible Results (CSV)
+              </button>
+            </div>
             <div class="table-wrapper">
               <table id="resultsTable">
                 <thead>
@@ -197,11 +210,43 @@
           <section id="predictionPanel" class="glass hidden">
             <div class="pred-header">
               <h2 class="section-title">Prediction Engine</h2>
-              <button id="rerunPrediction" class="btn primary rerun-btn">
-                ⟳ Rerun
-              </button>
+              <div class="pred-header-actions">
+                <button id="exportDiagnosticsBtn" class="btn secondary" disabled>
+                  Export Diagnostics
+                </button>
+                <button id="generateCandidatesBtn" class="btn secondary" disabled>
+                  Generate Candidates
+                </button>
+                <button id="rerunPrediction" class="btn primary rerun-btn">
+                  ⟳ Rerun
+                </button>
+              </div>
             </div>
-            <div id="predictionWarning" class="warning-banner"></div>
+            <div id="predictionWarning" class="warning-banner">
+              <div id="predictionWarningText">Ready</div>
+              <div id="predictionProgressWrap" class="prediction-progress hidden">
+                <div
+                  id="predictionProgressTrack"
+                  class="prediction-progress-track"
+                  role="progressbar"
+                  aria-valuemin="0"
+                  aria-valuemax="100"
+                  aria-valuenow="0"
+                >
+                  <div
+                    id="predictionProgressBar"
+                    class="prediction-progress-bar"
+                  ></div>
+                </div>
+              </div>
+            </div>
+
+            <div id="liveTrainingTracePanel" class="pred-card live-trace hidden">
+              <h3>Live Training Trace</h3>
+              <div id="liveTrainingTraceContent" class="live-trace-content">
+                <div class="trace-empty">Waiting for live validation samples...</div>
+              </div>
+            </div>
 
             <div class="pred-grid">
               <div class="pred-card">
@@ -236,8 +281,197 @@
           </section>
         </div>
 
-        <!-- RIGHT COLUMN: Backtest Lab -->
+        <!-- RIGHT COLUMN: Control Panel + Backtest Lab -->
         <div class="col-right">
+          <section id="modelSettingsPanel" class="glass">
+            <div class="pred-header">
+              <h2 class="section-title">Model Control Panel</h2>
+            </div>
+            <div class="model-section">
+              <h3>Training / Validation</h3>
+              <div class="model-grid">
+                <div class="control-item">
+                  <label for="settingTrainRatio">Train Ratio</label>
+                  <input
+                    id="settingTrainRatio"
+                    type="number"
+                    min="0.5"
+                    max="0.95"
+                    step="0.05"
+                    value="0.8"
+                  />
+                </div>
+                <div class="control-item">
+                  <label for="settingBacktestRefresh">Backtest Refresh Every N Draws</label>
+                  <input
+                    id="settingBacktestRefresh"
+                    type="number"
+                    min="2"
+                    max="30"
+                    placeholder="Auto"
+                  />
+                </div>
+                <div class="control-item">
+                  <label for="settingTargetLatencyMs">Target Latency (ms)</label>
+                  <input
+                    id="settingTargetLatencyMs"
+                    type="number"
+                    min="400"
+                    max="8000"
+                    step="100"
+                    value="1400"
+                  />
+                </div>
+                <div class="control-item model-check">
+                  <label><input id="settingFastMode" type="checkbox" /> Fast Mode</label>
+                </div>
+                <div class="control-item model-check">
+                  <label><input id="settingContinuousTraining" type="checkbox" checked /> Continuous Self-Training</label>
+                </div>
+                <div class="control-item">
+                  <label for="settingTargetSequenceMatch">Target Sequence Match</label>
+                  <input
+                    id="settingTargetSequenceMatch"
+                    type="number"
+                    min="1"
+                    max="6"
+                    step="1"
+                    value="6"
+                  />
+                </div>
+                <div class="control-item">
+                  <label for="settingMaxOptimizationRounds">Max Optimization Rounds (0 = no cap)</label>
+                  <input
+                    id="settingMaxOptimizationRounds"
+                    type="number"
+                    min="0"
+                    step="1"
+                    value="10"
+                  />
+                </div>
+                <div class="control-item model-check">
+                  <label
+                    ><input id="settingMasteryBacktestMode" type="checkbox" />
+                    Sequence Mastery Backtest</label
+                  >
+                </div>
+                <div class="control-item">
+                  <label for="settingMasteryMaxAttemptsPerSequence"
+                    >Max Attempts / Sequence (0 = no cap)</label
+                  >
+                  <input
+                    id="settingMasteryMaxAttemptsPerSequence"
+                    type="number"
+                    min="0"
+                    step="1"
+                    value="180"
+                  />
+                </div>
+                <div class="control-item">
+                  <label for="settingMasteryGlobalAttemptCap"
+                    >Global Attempt Cap (0 = no cap)</label
+                  >
+                  <input
+                    id="settingMasteryGlobalAttemptCap"
+                    type="number"
+                    min="0"
+                    step="1"
+                    value="20000"
+                  />
+                </div>
+                <div class="control-item">
+                  <label for="settingMasteryProgressEveryAttempts"
+                    >Mastery Progress Every N Attempts</label
+                  >
+                  <input
+                    id="settingMasteryProgressEveryAttempts"
+                    type="number"
+                    min="1"
+                    step="1"
+                    value="8"
+                  />
+                </div>
+              </div>
+            </div>
+
+            <div class="model-section">
+              <h3>Candidate Generation</h3>
+              <div class="model-grid">
+                <div class="control-item model-check">
+                  <label><input id="settingEnableMonteCarlo" type="checkbox" checked /> Monte Carlo</label>
+                </div>
+                <div class="control-item model-check">
+                  <label><input id="settingEnableGenetic" type="checkbox" checked /> Genetic Optimizer</label>
+                </div>
+                <div class="control-item model-check">
+                  <label><input id="settingEnableHistoricalEcho" type="checkbox" checked /> Historical Echo</label>
+                </div>
+                <div class="control-item model-check">
+                  <label><input id="settingEnableSlidingWindow" type="checkbox" checked /> Sliding Window</label>
+                </div>
+              </div>
+            </div>
+
+            <div class="model-section">
+              <h3>Search Budgets</h3>
+              <div class="model-grid">
+                <div class="control-item">
+                  <label for="settingMonteCarloMin">MC Min Trials</label>
+                  <input
+                    id="settingMonteCarloMin"
+                    type="number"
+                    min="100"
+                    max="50000"
+                    step="100"
+                    placeholder="Auto"
+                  />
+                </div>
+                <div class="control-item">
+                  <label for="settingMonteCarloMax">MC Max Trials</label>
+                  <input
+                    id="settingMonteCarloMax"
+                    type="number"
+                    min="500"
+                    max="100000"
+                    step="100"
+                    placeholder="Auto"
+                  />
+                </div>
+                <div class="control-item">
+                  <label for="settingGeneticGenerations">GA Generations</label>
+                  <input
+                    id="settingGeneticGenerations"
+                    type="number"
+                    min="5"
+                    max="200"
+                    step="1"
+                    placeholder="Auto"
+                  />
+                </div>
+                <div class="control-item">
+                  <label for="settingGeneticPopulation">GA Population</label>
+                  <input
+                    id="settingGeneticPopulation"
+                    type="number"
+                    min="20"
+                    max="600"
+                    step="5"
+                    placeholder="Auto"
+                  />
+                </div>
+              </div>
+            </div>
+
+            <div class="control-actions">
+              <button id="stopTrainingBtn" class="btn secondary">
+                Stop Training
+              </button>
+              <button id="applyModelSettingsBtn" class="btn primary">
+                Apply Settings & Retrain
+              </button>
+            </div>
+          </section>
+
           <section id="backtestLabPanel" class="glass hidden">
             <div class="pred-header">
               <h2 class="section-title">Backtest Lab</h2>

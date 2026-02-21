@@ -20,6 +20,13 @@ export interface FormatEra {
   drawCount: number;
 }
 
+function inferDrawPoolSize(draw: DrawRecord): number {
+  const maxInDraw = Math.max(...draw.numbers, draw.bonus || 0);
+  if (maxInDraw > 52) return 58;
+  if (maxInDraw > 49) return 52;
+  return 49;
+}
+
 /**
  * Auto-detect the pool size for each draw.
  * The SA LOTTO has changed from 6/49 → 6/52 → 6/58 over the years.
@@ -50,10 +57,7 @@ export function detectFormat(draws: DrawRecord[]): {
   let lastPoolSize = -1;
 
   for (let i = 0; i < draws.length; i++) {
-    const maxInDraw = Math.max(...draws[i].numbers, draws[i].bonus || 0);
-    let poolAtI = 49;
-    if (maxInDraw > 52) poolAtI = 58;
-    else if (maxInDraw > 49) poolAtI = 52;
+    const poolAtI = inferDrawPoolSize(draws[i]);
 
     if (lastPoolSize === -1) {
       lastPoolSize = poolAtI;
@@ -490,6 +494,144 @@ export function transitionAnalysis(
   return results;
 }
 
+// ─── Entropy / Regime Diagnostics ───────────────────────────────────
+export type EntropyRegime = "structured" | "neutral" | "diffuse";
+
+export interface EntropyDiagnostics {
+  normalizedEntropy: number;
+  concentration: number;
+  entropyTrend: number;
+  rollingEntropy: number[];
+  windowSize: number;
+  regime: EntropyRegime;
+}
+
+function clampUnit(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  if (value < 0) return 0;
+  if (value > 1) return 1;
+  return value;
+}
+
+function normalizedShannonEntropy(counts: number[], N: number): number {
+  const total = counts.reduce((sum, count) => sum + count, 0);
+  if (total <= 0 || N <= 1) return 1;
+
+  let entropy = 0;
+  for (let i = 1; i <= N; i++) {
+    const count = counts[i] || 0;
+    if (count <= 0) continue;
+    const p = count / total;
+    entropy -= p * Math.log2(p);
+  }
+
+  const maxEntropy = Math.log2(N);
+  return clampUnit(maxEntropy > 0 ? entropy / maxEntropy : 1);
+}
+
+function countNumbersInDrawWindow(draws: DrawRecord[], N: number): number[] {
+  const counts = new Array(N + 1).fill(0);
+  for (const draw of draws) {
+    const all = [...draw.numbers, draw.bonus].filter((n) => n > 0 && n <= N);
+    for (const n of all) counts[n]++;
+  }
+  return counts;
+}
+
+export function entropyDiagnostics(
+  draws: DrawRecord[],
+  N: number,
+): EntropyDiagnostics {
+  if (draws.length === 0) {
+    return {
+      normalizedEntropy: 1,
+      concentration: 0,
+      entropyTrend: 0,
+      rollingEntropy: [],
+      windowSize: 0,
+      regime: "neutral",
+    };
+  }
+
+  const preferredWindow = Math.max(20, Math.round(draws.length * 0.22));
+  const windowSize = Math.max(8, Math.min(draws.length, preferredWindow));
+  const stride = Math.max(4, Math.floor(windowSize / 3));
+
+  const rollingEntropy: number[] = [];
+  if (draws.length <= windowSize) {
+    rollingEntropy.push(
+      normalizedShannonEntropy(countNumbersInDrawWindow(draws, N), N),
+    );
+  } else {
+    for (let start = 0; start + windowSize <= draws.length; start += stride) {
+      const segment = draws.slice(start, start + windowSize);
+      rollingEntropy.push(
+        normalizedShannonEntropy(countNumbersInDrawWindow(segment, N), N),
+      );
+    }
+    const tailStart = Math.max(0, draws.length - windowSize);
+    const tail = draws.slice(tailStart);
+    const tailEntropy = normalizedShannonEntropy(
+      countNumbersInDrawWindow(tail, N),
+      N,
+    );
+    if (
+      rollingEntropy.length === 0 ||
+      Math.abs(rollingEntropy[rollingEntropy.length - 1] - tailEntropy) > 1e-6
+    ) {
+      rollingEntropy.push(tailEntropy);
+    }
+  }
+
+  const recentWindow = draws.slice(-windowSize);
+  const recentCounts = countNumbersInDrawWindow(recentWindow, N);
+  const normalizedEntropy = normalizedShannonEntropy(recentCounts, N);
+
+  const totalRecent = recentCounts.reduce((sum, count) => sum + count, 0);
+  let hhi = 0;
+  if (totalRecent > 0) {
+    for (let i = 1; i <= N; i++) {
+      const p = recentCounts[i] / totalRecent;
+      hhi += p * p;
+    }
+  }
+  const uniformHhi = 1 / Math.max(1, N);
+  const concentration = clampUnit((hhi - uniformHhi) / (1 - uniformHhi));
+
+  let entropyTrend = 0;
+  if (rollingEntropy.length >= 2) {
+    const split = Math.max(1, Math.floor(rollingEntropy.length / 2));
+    const early = rollingEntropy.slice(0, split);
+    const late = rollingEntropy.slice(split);
+    const avg = (arr: number[]) =>
+      arr.reduce((sum, value) => sum + value, 0) / Math.max(1, arr.length);
+    entropyTrend = avg(late) - avg(early);
+  }
+
+  let regime: EntropyRegime = "neutral";
+  if (
+    normalizedEntropy <= 0.94 ||
+    (entropyTrend < -0.015 && concentration >= 0.08)
+  ) {
+    regime = "structured";
+  } else if (
+    normalizedEntropy >= 0.98 &&
+    concentration <= 0.05 &&
+    entropyTrend >= -0.01
+  ) {
+    regime = "diffuse";
+  }
+
+  return {
+    normalizedEntropy,
+    concentration,
+    entropyTrend,
+    rollingEntropy,
+    windowSize,
+    regime,
+  };
+}
+
 // ─── Full Diagnostics Bundle ────────────────────────────────────────
 export interface FullDiagnostics {
   totalDraws: number;
@@ -508,6 +650,7 @@ export interface FullDiagnostics {
   topQuintets: QuintetResult[];
   positionalFreq: PositionalFreq[];
   transitions: TransitionResult[];
+  entropy: EntropyDiagnostics;
   biasDetected: boolean;
   biasReasons: string[];
   eras: FormatEra[];
@@ -517,11 +660,11 @@ export function runFullDiagnostics(draws: DrawRecord[]): FullDiagnostics {
   const { currentN, currentDraws, eras } = detectFormat(draws);
   const N = currentN;
 
-  // Ensure at least 1000 draws for relationship analysis if available
-  let relationshipDraws = currentDraws;
-  if (relationshipDraws.length < 1000) {
-    relationshipDraws = draws.slice(Math.max(0, draws.length - 1000));
-  }
+  // Relationship analysis should stay within the same detected format pool.
+  // Mixing 6/49, 6/52, and 6/58 eras can dilute affinity/transition signals.
+  const samePoolDraws = draws.filter((draw) => inferDrawPoolSize(draw) === N);
+  const relationshipDraws =
+    samePoolDraws.length > 0 ? samePoolDraws : currentDraws;
 
   // BIAS DIAGNOSTICS: Stay era-pure for frequency/uniformity
   const freq = frequencyAnalysis(currentDraws, N);
@@ -532,13 +675,14 @@ export function runFullDiagnostics(draws: DrawRecord[]): FullDiagnostics {
   const chi = chiSquareTest(currentDraws, N);
   const ac = autocorrelationAnalysis(currentDraws, N);
 
-  // RELATIONSHIP ANALYSIS: Use deep history (1000 draws)
+  // RELATIONSHIP ANALYSIS: Use full uploaded history
   const deltas = deltaAnalysis(relationshipDraws);
   const triples = tripleAnalysis(relationshipDraws, 50);
   const quadruples = quadrupleAnalysis(relationshipDraws, 20);
   const quintets = quintetAnalysis(relationshipDraws, 10);
   const positional = positionalFrequencyAnalysis(relationshipDraws, N);
   const transitions = transitionAnalysis(relationshipDraws, N);
+  const entropy = entropyDiagnostics(currentDraws, N);
 
   const sigAutocorr = ac.filter((a) => a.isSignificant);
   const biasReasons: string[] = [];
@@ -550,6 +694,8 @@ export function runFullDiagnostics(draws: DrawRecord[]): FullDiagnostics {
     biasReasons.push("High number of overdue values");
   if (hc.filter((h) => h.status === "hot").length < 3)
     biasReasons.push("Weak recent trend (Cold cycle)");
+  if (entropy.regime === "structured")
+    biasReasons.push("Entropy contraction (structured regime)");
 
   const biasDetected = biasReasons.length > 0;
 
@@ -570,6 +716,7 @@ export function runFullDiagnostics(draws: DrawRecord[]): FullDiagnostics {
     topQuintets: quintets,
     positionalFreq: positional,
     transitions,
+    entropy,
     biasDetected,
     biasReasons,
     eras,
