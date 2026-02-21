@@ -1178,14 +1178,18 @@ export interface PredictionOutput {
   warning: string;
 }
 
+const MAX_PREDICTION_WINDOW_DRAWS = 450;
+
 export function runPrediction(
   draws: DrawRecord[],
   diagnostics: FullDiagnostics,
 ): PredictionOutput {
   const N = diagnostics.poolSize;
 
-  // TARGET WINDOW: Use up to 1000 rows for training/validation
-  const targetWindow = 1000;
+  // Keep prediction latency stable on large uploads.
+  // A smaller rolling window still captures recent behavior while preventing
+  // expensive O(n²) backtest loops from locking up the UI.
+  const targetWindow = MAX_PREDICTION_WINDOW_DRAWS;
   const startIndex = Math.max(0, draws.length - targetWindow);
   // PHASE 5: Enforce chronological order (Oldest -> Newest) for correct learning direction
   const eraDraws = draws.slice(startIndex).sort((a, b) => {
