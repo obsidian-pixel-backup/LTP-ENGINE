@@ -1,0 +1,262 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>SA Lotto Historical Results Viewer</title>
+    <link rel="stylesheet" href="./style.css" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+  </head>
+  <body>
+    <div id="app">
+      <header>
+        <h1>Lotto Results Explorer</h1>
+        <p>Analyze historical South African Lotto data with ease.</p>
+      </header>
+
+      <main class="three-col-layout">
+        <!-- LEFT COLUMN: Controls + Historical Data -->
+        <div class="col-left">
+          <section id="controls" class="glass">
+            <div class="control-group file-upload-group">
+              <label for="fileInput" class="btn primary"
+                >Upload Excel File</label
+              >
+              <input type="file" id="fileInput" accept=".xlsx, .xls" hidden />
+              <span id="fileNameDisplay">No file selected</span>
+            </div>
+
+            <div class="control-grid">
+              <div class="control-item">
+                <label for="searchInput">Search Results</label>
+                <input
+                  type="text"
+                  id="searchInput"
+                  placeholder="Search draw, numbers..."
+                />
+              </div>
+              <div class="control-item">
+                <label>Date Range Filter</label>
+                <div class="date-range">
+                  <input type="date" id="dateFrom" />
+                  <span>to</span>
+                  <input type="date" id="dateTo" />
+                </div>
+              </div>
+              <div class="control-item">
+                <label for="sortOrder">Sort by Date</label>
+                <select id="sortOrder">
+                  <option value="asc">Oldest First</option>
+                  <option value="desc" selected>Newest First</option>
+                </select>
+              </div>
+            </div>
+
+            <div id="manualEntry" class="manual-entry-section">
+              <h3>Add Manual Result</h3>
+              <div class="manual-entry-row">
+                <div class="numbers-group">
+                  <input
+                    type="number"
+                    id="num1"
+                    min="1"
+                    placeholder="#"
+                    class="num-input"
+                  />
+                  <input
+                    type="number"
+                    id="num2"
+                    min="1"
+                    placeholder="#"
+                    class="num-input"
+                  />
+                  <input
+                    type="number"
+                    id="num3"
+                    min="1"
+                    placeholder="#"
+                    class="num-input"
+                  />
+                  <input
+                    type="number"
+                    id="num4"
+                    min="1"
+                    placeholder="#"
+                    class="num-input"
+                  />
+                  <input
+                    type="number"
+                    id="num5"
+                    min="1"
+                    placeholder="#"
+                    class="num-input"
+                  />
+                  <input
+                    type="number"
+                    id="num6"
+                    min="1"
+                    placeholder="#"
+                    class="num-input"
+                  />
+                </div>
+                <div class="bonus-group">
+                  <span class="plus-sign">+</span>
+                  <input
+                    type="number"
+                    id="manualBonus"
+                    min="1"
+                    placeholder="B"
+                    class="bonus-input"
+                  />
+                </div>
+                <button id="addManualBtn" class="btn primary small-btn">
+                  Add
+                </button>
+                <button id="clearDataBtn" class="btn secondary small-btn">
+                  Clear
+                </button>
+              </div>
+            </div>
+
+            <div id="formattingRules" class="formatting-options">
+              <h3>Display Options</h3>
+              <div class="checkbox-group">
+                <label
+                  ><input type="checkbox" id="ruleNumberRanges" checked />
+                  Number Grouping</label
+                >
+                <label
+                  ><input type="checkbox" id="ruleBonusBall" checked /> Bonus
+                  Ball</label
+                >
+                <label
+                  ><input type="checkbox" id="ruleJackpot" checked /> Jackpot
+                  Rows</label
+                >
+                <label
+                  ><input type="checkbox" id="ruleSpecialDates" checked />
+                  Recent Draws</label
+                >
+              </div>
+              <div class="legend">
+                <div class="legend-item">
+                  <div
+                    class="legend-color"
+                    style="background: var(--range-low)"
+                  ></div>
+                  <span>Low (1-14)</span>
+                </div>
+                <div class="legend-item">
+                  <div
+                    class="legend-color"
+                    style="background: var(--range-med)"
+                  ></div>
+                  <span>Med (15-28)</span>
+                </div>
+                <div class="legend-item">
+                  <div
+                    class="legend-color"
+                    style="background: var(--range-med-high)"
+                  ></div>
+                  <span>MH (29-42)</span>
+                </div>
+                <div class="legend-item">
+                  <div
+                    class="legend-color"
+                    style="background: var(--range-high)"
+                  ></div>
+                  <span>High (43-58)</span>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section id="tableContainer" class="glass">
+            <div class="table-wrapper">
+              <table id="resultsTable">
+                <thead>
+                  <tr id="tableHeader"></tr>
+                </thead>
+                <tbody id="tableBody"></tbody>
+              </table>
+            </div>
+            <div id="loader" class="hidden">Parsing Excel Data...</div>
+            <div id="noData" class="hidden">
+              <p>No results found matching your filters.</p>
+            </div>
+          </section>
+        </div>
+
+        <!-- MIDDLE COLUMN: Prediction Engine -->
+        <div class="col-middle">
+          <section id="predictionPanel" class="glass hidden">
+            <div class="pred-header">
+              <h2 class="section-title">Prediction Engine</h2>
+              <button id="rerunPrediction" class="btn primary rerun-btn">
+                ⟳ Rerun
+              </button>
+            </div>
+            <div id="predictionWarning" class="warning-banner"></div>
+
+            <div class="pred-grid">
+              <div class="pred-card">
+                <h3>Bias Diagnostics</h3>
+                <div id="diagContent"></div>
+              </div>
+              <div class="pred-card">
+                <h3>Backtest Results</h3>
+                <div id="backtestContent"></div>
+              </div>
+            </div>
+
+            <div class="pred-card">
+              <h3>Hot & Cold Numbers (Last 20 Draws)</h3>
+              <div id="hotColdGrid" class="number-grid"></div>
+            </div>
+
+            <div class="pred-card">
+              <h3>Top Co-occurring Pairs</h3>
+              <div id="topPairsContent"></div>
+            </div>
+
+            <div class="pred-card">
+              <h3>Most Common Group Patterns (L-M-MH-H)</h3>
+              <div id="groupPatternsContent"></div>
+            </div>
+
+            <div class="pred-card highlight-card">
+              <h3>Predicted Next Draw Candidates</h3>
+              <div id="predictedSets"></div>
+            </div>
+          </section>
+        </div>
+
+        <!-- RIGHT COLUMN: Backtest Lab -->
+        <div class="col-right">
+          <section id="backtestLabPanel" class="glass hidden">
+            <div class="pred-header">
+              <h2 class="section-title">Backtest Lab</h2>
+            </div>
+            <div class="pred-card">
+              <h3>Learning Progress</h3>
+              <div id="learningProgressContent"></div>
+            </div>
+            <div class="pred-card">
+              <h3>Step-by-Step Validation</h3>
+              <div
+                id="backtestRowsContent"
+                style="max-height: 800px; overflow-y: auto"
+              ></div>
+            </div>
+          </section>
+        </div>
+      </main>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
