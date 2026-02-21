@@ -7,6 +7,7 @@ interface LottoResult {
 }
 
 class LottoViewer {
+  private static readonly MIN_PREDICTION_DRAWS = 120;
   private rawData: LottoResult[] = [];
   private filteredData: LottoResult[] = [];
   private headers: string[] = [];
@@ -105,15 +106,21 @@ class LottoViewer {
       const firstSheetName = workbook.SheetNames[0];
       const worksheet = workbook.Sheets[firstSheetName];
 
-      this.rawData = XLSX.utils.sheet_to_json(worksheet, { raw: false });
+      this.rawData = XLSX.utils.sheet_to_json(worksheet, {
+        raw: false,
+        defval: "",
+      });
 
-      if (this.rawData.length > 0) {
-        this.headers = Object.keys(this.rawData[0]);
-        this.saveToSessionStorage();
-        this.parseDrawRecords();
-        this.applyFilters();
-        this.runPredictionEngine();
+      if (this.rawData.length === 0) {
+        alert("No rows were detected in the selected file.");
+        return;
       }
+
+      this.headers = Object.keys(this.rawData[0]);
+      this.saveToSessionStorage();
+      this.parseDrawRecords();
+      this.applyFilters();
+      this.runPredictionEngine();
     } catch (error) {
       console.error("Error parsing Excel:", error);
       alert("Failed to parse Excel file. Please ensure it's a valid XLSX.");
@@ -152,14 +159,24 @@ class LottoViewer {
     const date = `${year}-${month}-${day}`;
 
     const numbers = this.manualNums.map((input) => parseInt(input.value));
-    if (numbers.some((n) => isNaN(n) || n < 1)) {
-      alert("Please enter 6 valid numbers.");
+    if (numbers.some((n) => isNaN(n) || n < 1 || n > this.poolSize)) {
+      alert(`Please enter 6 valid numbers between 1 and ${this.poolSize}.`);
+      return;
+    }
+
+    if (new Set(numbers).size !== numbers.length) {
+      alert("Manual entry numbers must be unique.");
       return;
     }
 
     const bonus = parseInt(this.manualBonus.value);
-    if (isNaN(bonus) || bonus < 1) {
-      alert("Please enter a valid bonus ball number.");
+    if (isNaN(bonus) || bonus < 1 || bonus > this.poolSize) {
+      alert(`Please enter a bonus ball between 1 and ${this.poolSize}.`);
+      return;
+    }
+
+    if (numbers.includes(bonus)) {
+      alert("Bonus ball cannot duplicate one of the main numbers.");
       return;
     }
 
@@ -247,6 +264,8 @@ class LottoViewer {
   }
 
   private parseDrawRecords() {
+    const numberKeyRegex = /^number\s*\d+$/i;
+
     this.drawRecords = this.rawData
       .map((row) => {
         const numbers: number[] = [];
@@ -257,7 +276,7 @@ class LottoViewer {
           const k = key.toLowerCase();
           if (k.includes("date")) dateVal = val;
           else if (k === "bonus") bonus = parseInt(val) || 0;
-          else if (k.startsWith("number")) {
+          else if (numberKeyRegex.test(k.replace(/[^a-z0-9]/gi, ""))) {
             const n = parseInt(val);
             if (!isNaN(n)) numbers.push(n);
           }
@@ -285,9 +304,14 @@ class LottoViewer {
         numbers.sort((a, b) => a - b);
         return { date, numbers, bonus };
       })
-      .filter(
-        (d) => d.numbers.length === 6 && !isNaN(new Date(d.date).getTime()),
-      )
+      .filter((d) => {
+        const hasValidDate = !isNaN(new Date(d.date).getTime());
+        const hasValidNumbers =
+          d.numbers.length === 6 &&
+          new Set(d.numbers).size === 6 &&
+          d.numbers.every((n) => n >= 1 && n <= this.poolSize);
+        return hasValidDate && hasValidNumbers;
+      })
       .sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
   }
 
@@ -306,8 +330,16 @@ class LottoViewer {
       let matchesDate = true;
       if (dateVal) {
         const drawDate = new Date(dateVal);
-        if (from && drawDate < new Date(from)) matchesDate = false;
-        if (to && drawDate > new Date(to)) matchesDate = false;
+        if (!isNaN(drawDate.getTime())) {
+          if (from) {
+            const fromDate = new Date(`${from}T00:00:00`);
+            if (drawDate < fromDate) matchesDate = false;
+          }
+          if (to) {
+            const toDate = new Date(`${to}T23:59:59`);
+            if (drawDate > toDate) matchesDate = false;
+          }
+        }
       }
 
       return matchesSearch && matchesDate;
@@ -446,10 +478,10 @@ class LottoViewer {
   // ─── PREDICTION ENGINE ─────────────────────────────────────────────
   private async handleRerun() {
     console.log("handleRerun called. Records:", this.drawRecords.length);
-    if (this.drawRecords.length < 200) {
+    if (this.drawRecords.length < LottoViewer.MIN_PREDICTION_DRAWS) {
       console.warn("Not enough records to rerun.");
       alert(
-        "No data found in memory. Please re-upload the Excel file to run predictions.",
+        `Not enough historical rows loaded. At least ${LottoViewer.MIN_PREDICTION_DRAWS} valid draws are needed.`,
       );
       return;
     }
@@ -498,7 +530,7 @@ class LottoViewer {
   }
 
   private runPredictionEngine() {
-    if (this.drawRecords.length < 200) return;
+    if (this.drawRecords.length < LottoViewer.MIN_PREDICTION_DRAWS) return;
 
     const diagnostics = runFullDiagnostics(this.drawRecords);
     this.poolSize = diagnostics.poolSize;

@@ -604,7 +604,7 @@ export function generateCandidateSets(
     const probDist =
       totalComposite > 0
         ? scores.map((s) => s.compositeScore / totalComposite)
-        : scores.map(() => 1 / scores.length);
+        : scores.map(() => 1 / Math.max(1, scores.length));
     let bestMC: number[] = [];
     let bestMCScore = -Infinity;
 
@@ -929,6 +929,29 @@ export function backtest(
   N: number,
   trainRatio = 0.8, // Updated to 80/20 as requested
 ): BacktestResult {
+  if (draws.length < 2) {
+    const diagnostics = runFullDiagnostics(draws);
+    return {
+      trainSize: draws.length,
+      testSize: 0,
+      modelHits: 0,
+      baselineHitRate: 7 / N,
+      modelHitRate: 0,
+      improvement: 0,
+      top6Overlap: 0,
+      rowDetails: [],
+      profilePerformance: WEIGHT_PROFILES.map((p) => ({
+        name: p.name,
+        overlap: 0,
+      })),
+      finalDiagnostics: diagnostics,
+      finalBestProfile: WEIGHT_PROFILES[0],
+      learningTrend: 0,
+      earlyMatches: 0,
+      recentMatches: 0,
+    };
+  }
+
   const splitIdx = Math.floor(draws.length * trainRatio);
   const trainDraws = draws.slice(0, splitIdx);
   const testDraws = draws.slice(splitIdx);
@@ -1059,7 +1082,8 @@ export function backtest(
     }
   }
 
-  const avgTop6Overlap = top6TotalOverlap / testDraws.length;
+  const avgTop6Overlap =
+    testDraws.length > 0 ? top6TotalOverlap / testDraws.length : 0;
   const modelHitRate = avgTop6Overlap / K; // Hits per prediction slot
   const baselinePercentage = K / N; // Expected hit-rate for random 6-number pick
 
