@@ -721,6 +721,10 @@ class LottoViewer {
         <span class="diag-value">${bt.top6Overlap.toFixed(2)} / 6</span>
       </div>
       <div class="diag-stat">
+        <span class="diag-label">4+ Matches Frequency</span>
+        <span class="diag-value ${bt.fourPlusRate > 0 ? "pass" : "fail"}">${(bt.fourPlusRate * 100).toFixed(1)}% (${bt.fourPlusHits}/${bt.testSize})</span>
+      </div>
+      <div class="diag-stat">
         <span class="diag-label">Learning Trend</span>
         <span class="diag-value ${bt.learningTrend >= 0 ? "pass" : "fail"}">
           ${bt.learningTrend >= 0 ? "▲" : "▼"} ${Math.abs(bt.learningTrend).toFixed(1)}%

@@ -922,6 +922,15 @@ export interface BacktestResult {
   learningTrend: number; // Percentage change (Last 50 vs First 50)
   earlyMatches: number; // Avg matches in first 50
   recentMatches: number; // Avg matches in last 50
+  fourPlusHits: number;
+  fourPlusRate: number;
+}
+
+function matchUtility(overlap: number): number {
+  if (overlap >= 5) return overlap + 8;
+  if (overlap >= 4) return overlap + 4;
+  if (overlap === 3) return overlap + 1;
+  return overlap;
 }
 
 export function backtest(
@@ -949,6 +958,8 @@ export function backtest(
       learningTrend: 0,
       earlyMatches: 0,
       recentMatches: 0,
+      fourPlusHits: 0,
+      fourPlusRate: 0,
     };
   }
 
@@ -976,10 +987,21 @@ export function backtest(
     const valDiag = runFullDiagnostics(valTrain);
     for (const profile of WEIGHT_PROFILES) {
       const s = compositeScoring(valDiag, valTrain, profile);
-      const t6 = new Set(s.slice(0, K).map((x) => x.number));
+      const seededValRng = createSeededRandom(
+        hashStringToSeed(`val:${profile.name}:${valTrain.length}`),
+      );
+      const valSet = generateCandidateSets(
+        s,
+        valDiag,
+        valTrain,
+        1,
+        seededValRng,
+      )[0]?.numbers;
+      const t6 = new Set(valSet ?? s.slice(0, K).map((x) => x.number));
       let o = 0;
       for (const d of valTest) {
-        o += d.numbers.filter((n) => t6.has(n)).length;
+        const overlap = d.numbers.filter((n) => t6.has(n)).length;
+        o += matchUtility(overlap);
       }
       if (o > bestProfileOverlap) {
         bestProfileOverlap = o;
@@ -989,6 +1011,7 @@ export function backtest(
   }
 
   let hits = 0;
+  let fourPlusHits = 0;
   let top6TotalOverlap = 0;
   const rowDetails: Array<{
     date: string;
@@ -1007,13 +1030,23 @@ export function backtest(
       history,
       bestProfile,
     );
-    const top6 = new Set(currentScores.slice(0, K).map((s) => s.number));
+    const drawSeed = `${testDraw.date}:${history.length}:${bestProfile.name}`;
+    const drawRng = createSeededRandom(hashStringToSeed(drawSeed));
+    const bestSet = generateCandidateSets(
+      currentScores,
+      currentDiagnostics,
+      history,
+      1,
+      drawRng,
+    )[0]?.numbers;
+    const top6 = new Set(bestSet ?? currentScores.slice(0, K).map((s) => s.number));
 
     // 2. Validate against actual draw (main numbers only, 6-of-N objective)
     const actualMain = [...testDraw.numbers].filter((n) => n > 0);
     const t6Overlap = actualMain.filter((n) => top6.has(n)).length;
 
     if (t6Overlap > 0) hits++;
+    if (t6Overlap >= 4) fourPlusHits++;
     top6TotalOverlap += t6Overlap;
 
     rowDetails.push({
@@ -1028,14 +1061,23 @@ export function backtest(
     const rollingWindow = 50;
     WEIGHT_PROFILES.forEach((p, idx) => {
       const ps = compositeScoring(currentDiagnostics, history, p);
-      const pt6 = new Set(ps.slice(0, K).map((x) => x.number));
+      const profileSeed = `${testDraw.date}:${history.length}:${p.name}`;
+      const profileRng = createSeededRandom(hashStringToSeed(profileSeed));
+      const profileSet = generateCandidateSets(
+        ps,
+        currentDiagnostics,
+        history,
+        1,
+        profileRng,
+      )[0]?.numbers;
+      const pt6 = new Set(profileSet ?? ps.slice(0, K).map((x) => x.number));
       const po = actualMain.filter((n) => pt6.has(n)).length;
 
       // Update rolling overlap (we store per-draw result and sum the last 50)
       if (!profilePerformance[idx].rollingHistory)
         (profilePerformance[idx] as any).rollingHistory = [];
       const rh = (profilePerformance[idx] as any).rollingHistory as number[];
-      rh.push(po);
+      rh.push(matchUtility(po));
       if (rh.length > rollingWindow) rh.shift();
       profilePerformance[idx].overlap = rh.reduce((a, b) => a + b, 0);
     });
@@ -1105,6 +1147,8 @@ export function backtest(
     learningTrend: 0,
     earlyMatches: 0,
     recentMatches: 0,
+    fourPlusHits,
+    fourPlusRate: testDraws.length > 0 ? fourPlusHits / testDraws.length : 0,
   };
 
   // PHASE 6: Calculate Learning Trend (Recent 50 vs First 50 test rows)
