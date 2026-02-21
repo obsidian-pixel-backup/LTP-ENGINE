@@ -15,6 +15,26 @@ import {
   runFullDiagnostics,
 } from "./analysis";
 
+function hashStringToSeed(value: string): number {
+  let hash = 2166136261;
+  for (let i = 0; i < value.length; i++) {
+    hash ^= value.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+}
+
+function createSeededRandom(seed: number): () => number {
+  let state = seed || 1;
+  return () => {
+    state += 0x6d2b79f5;
+    let t = state;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
 // ─── Bayesian Smoothed Marginals ────────────────────────────────────
 export interface BayesianResult {
   number: number;
@@ -494,6 +514,7 @@ export function generateCandidateSets(
   diagnostics: FullDiagnostics,
   draws: DrawRecord[],
   numSets: number = 10,
+  rng: () => number = Math.random,
 ): PredictedSet[] {
   const N = diagnostics.poolSize;
   const candidates: PredictedSet[] = [];
@@ -580,7 +601,10 @@ export function generateCandidateSets(
   // 5. Monte Carlo Optimized (20,000 trials + Seeded Sampling)
   {
     const totalComposite = scores.reduce((s, x) => s + x.compositeScore, 0);
-    const probDist = scores.map((s) => s.compositeScore / totalComposite);
+    const probDist =
+      totalComposite > 0
+        ? scores.map((s) => s.compositeScore / totalComposite)
+        : scores.map(() => 1 / Math.max(1, scores.length));
     let bestMC: number[] = [];
     let bestMCScore = -Infinity;
 
@@ -596,7 +620,7 @@ export function generateCandidateSets(
         const seed =
           diagnostics.topTriples[
             Math.floor(
-              Math.random() * Math.min(5, diagnostics.topTriples.length),
+              rng() * Math.min(5, diagnostics.topTriples.length),
             )
           ];
         set = [seed.i, seed.j, seed.k];
@@ -609,7 +633,7 @@ export function generateCandidateSets(
 
       while (set.length < K) {
         const totalP = available.reduce((s, a) => s + a.prob, 0);
-        let r = Math.random() * totalP;
+        let r = rng() * totalP;
         let chosen = 0;
         for (let i = 0; i < available.length; i++) {
           r -= available[i].prob;
@@ -634,7 +658,7 @@ export function generateCandidateSets(
         bestMC = [...set];
       }
     }
-    addSet(bestMC, "Monte Carlo Best");
+    addSet(bestMC.length === K ? bestMC : scores.slice(0, K).map((s) => s.number), "Monte Carlo Best");
   }
 
   // 6. Pattern Mimic (Explicitly follows historical spacing/groups)
@@ -692,7 +716,7 @@ export function generateCandidateSets(
 
   // 7. Genetic Jackpot Optimizer (Elite evolution)
   {
-    const gaResult = runGeneticOptimization(scores, diagnostics);
+    const gaResult = runGeneticOptimization(scores, diagnostics, rng);
     addSet(gaResult, "Jackpot Target");
   }
 
@@ -783,7 +807,7 @@ export function generateCandidateSets(
 
   // 10. Sliding Window (picks blocks of high-scoring numbers)
   {
-    for (let i = 0; i < scores.length - K; i++) {
+    for (let i = 0; i <= scores.length - K; i++) {
       const combo = scores.slice(i, i + K).map((s) => s.number);
       addSet(combo, "Sliding Window High");
     }
@@ -801,13 +825,13 @@ export function generateCandidateSets(
     // Follow the strongest 2-step chains starting from last draw's numbers
     for (const startNum of lastNums) {
       const step1 = diagnostics.transitions.find(
-        (t) => t.fromNumber === startNum,
+        (t) => t.lag === 1 && t.fromNumber === startNum,
       );
       if (step1 && step1.toNumbers.length > 0) {
         const next1 = step1.toNumbers[0].number;
         chainSet.add(next1);
         const step2 = diagnostics.transitions.find(
-          (t) => t.fromNumber === next1,
+          (t) => t.lag === 1 && t.fromNumber === next1,
         );
         if (step2 && step2.toNumbers.length > 0) {
           chainSet.add(step2.toNumbers[0].number);
@@ -905,6 +929,29 @@ export function backtest(
   N: number,
   trainRatio = 0.8, // Updated to 80/20 as requested
 ): BacktestResult {
+  if (draws.length < 2) {
+    const diagnostics = runFullDiagnostics(draws);
+    return {
+      trainSize: draws.length,
+      testSize: 0,
+      modelHits: 0,
+      baselineHitRate: 7 / N,
+      modelHitRate: 0,
+      improvement: 0,
+      top6Overlap: 0,
+      rowDetails: [],
+      profilePerformance: WEIGHT_PROFILES.map((p) => ({
+        name: p.name,
+        overlap: 0,
+      })),
+      finalDiagnostics: diagnostics,
+      finalBestProfile: WEIGHT_PROFILES[0],
+      learningTrend: 0,
+      earlyMatches: 0,
+      recentMatches: 0,
+    };
+  }
+
   const splitIdx = Math.floor(draws.length * trainRatio);
   const trainDraws = draws.slice(0, splitIdx);
   const testDraws = draws.slice(splitIdx);
@@ -941,7 +988,6 @@ export function backtest(
     }
   }
 
-  let totalOverlap = 0;
   let hits = 0;
   let top6TotalOverlap = 0;
   const rowDetails: Array<{
@@ -962,39 +1008,28 @@ export function backtest(
       bestProfile,
     );
     const top6 = new Set(currentScores.slice(0, K).map((s) => s.number));
-    const topKNumbers = new Set(
-      currentScores.slice(0, K * 3).map((s) => s.number),
-    );
 
-    // 2. Validate against actual draw (ALL 7 NUMBERS)
-    const actual7 = [...testDraw.numbers, testDraw.bonus].filter((n) => n > 0);
-    const t6Overlap = actual7.filter((n) => top6.has(n)).length;
-    const kOverlap = actual7.filter((n) => topKNumbers.has(n)).length;
+    // 2. Validate against actual draw (main numbers only, 6-of-N objective)
+    const actualMain = [...testDraw.numbers].filter((n) => n > 0);
+    const t6Overlap = actualMain.filter((n) => top6.has(n)).length;
 
-    totalOverlap += kOverlap;
-    if (kOverlap > 0) hits++;
+    if (t6Overlap > 0) hits++;
     top6TotalOverlap += t6Overlap;
 
     rowDetails.push({
       date: testDraw.date,
-      actual: actual7.sort((a, b) => a - b),
+      actual: actualMain.sort((a, b) => a - b),
       predictedTop6: Array.from(top6).sort((a, b) => a - b),
       overlap: t6Overlap,
     });
 
-    // 3. "Learn" - Update history and diagnostics for the NEXT prediction
-    // CRITICAL: We only add testDraw to history AFTER we have already validated
-    // This allows online learning to pick the profile for the NEXT draw (t+1)
-    history.push(testDraw);
-    currentDiagnostics = runFullDiagnostics(history);
-
-    // Reinforcement: Aggregate performance for all profiles in the ROLLING WINDOW
-    // PHASE 6: Use a rolling performance buffer to pivot faster to local bias
+    // 3. Reinforcement update without leakage:
+    // evaluate profile predictions built from pre-outcome history only.
     const rollingWindow = 50;
     WEIGHT_PROFILES.forEach((p, idx) => {
       const ps = compositeScoring(currentDiagnostics, history, p);
       const pt6 = new Set(ps.slice(0, K).map((x) => x.number));
-      const po = actual7.filter((n) => pt6.has(n)).length;
+      const po = actualMain.filter((n) => pt6.has(n)).length;
 
       // Update rolling overlap (we store per-draw result and sum the last 50)
       if (!profilePerformance[idx].rollingHistory)
@@ -1004,6 +1039,10 @@ export function backtest(
       if (rh.length > rollingWindow) rh.shift();
       profilePerformance[idx].overlap = rh.reduce((a, b) => a + b, 0);
     });
+
+    // 4. "Learn" - Update history and diagnostics for the NEXT prediction
+    history.push(testDraw);
+    currentDiagnostics = runFullDiagnostics(history);
 
     // Strategy: Every 5 draws, compute a NEURAL ENSEMBLE profile (Phase 7)
     // We blend all profiles based on their rolling overlap squared (to favor experts)
@@ -1043,9 +1082,10 @@ export function backtest(
     }
   }
 
-  const avgTop6Overlap = top6TotalOverlap / testDraws.length;
+  const avgTop6Overlap =
+    testDraws.length > 0 ? top6TotalOverlap / testDraws.length : 0;
   const modelHitRate = avgTop6Overlap / K; // Hits per prediction slot
-  const baselinePercentage = 7 / N; // Probability of random number being a winner
+  const baselinePercentage = K / N; // Expected hit-rate for random 6-number pick
 
   const result: BacktestResult = {
     trainSize: trainDraws.length,
@@ -1110,6 +1150,11 @@ export function runPrediction(
 
   // PHASE 5: Run backtest FIRST to "warm up" the model through online learning
   const bt = backtest(eraDraws, N);
+  const seedBase = eraDraws
+    .slice(-50)
+    .map((d) => `${d.date}:${d.numbers.join("-")}:${d.bonus}`)
+    .join("|");
+  const rng = createSeededRandom(hashStringToSeed(seedBase));
 
   // Use the learned state for the final next-draw prediction
   const learnedProfile = bt.finalBestProfile;
@@ -1125,6 +1170,7 @@ export function runPrediction(
     learnedDiagnostics,
     eraDraws,
     10,
+    rng,
   );
   const bays = bayesianSmoothed(eraDraws, N);
 
@@ -1148,6 +1194,7 @@ export function runPrediction(
 function runGeneticOptimization(
   scores: NumberScore[],
   diag: FullDiagnostics,
+  rng: () => number,
   generations = 100,
   popSize = 250,
 ): number[] {
@@ -1158,9 +1205,9 @@ function runGeneticOptimization(
   // Initial Population
   let population: number[][] = [];
   for (let i = 0; i < popSize; i++) {
-    const set: number[] = [];
-    while (set.length < K) {
-      const n = numPool[Math.floor(Math.random() * numPool.length)];
+      const set: number[] = [];
+      while (set.length < K) {
+      const n = numPool[Math.floor(rng() * numPool.length)];
       if (!set.includes(n)) set.push(n);
     }
     population.push(set.sort((a, b) => a - b));
@@ -1185,9 +1232,9 @@ function runGeneticOptimization(
 
     // Tournament Selection
     const tournament = (size: number): number[] => {
-      let best = fitnessResults[Math.floor(Math.random() * popSize)];
+      let best = fitnessResults[Math.floor(rng() * popSize)];
       for (let i = 1; i < size; i++) {
-        const contestant = fitnessResults[Math.floor(Math.random() * popSize)];
+        const contestant = fitnessResults[Math.floor(rng() * popSize)];
         if (contestant.score > best.score) best = contestant;
       }
       return best.set;
@@ -1201,23 +1248,23 @@ function runGeneticOptimization(
       // Uniform Crossover
       const offspringSet = new Set<number>();
       for (let i = 0; i < K; i++) {
-        offspringSet.add(Math.random() < 0.5 ? p1[i] : p2[i]);
+        offspringSet.add(rng() < 0.5 ? p1[i] : p2[i]);
       }
       // Fill missing numbers (restricted to Top N pool)
       while (offspringSet.size < K) {
-        const n = numPool[Math.floor(Math.random() * numPool.length)];
+        const n = numPool[Math.floor(rng() * numPool.length)];
         offspringSet.add(n);
       }
       let offspring = Array.from(offspringSet).sort((a, b) => a - b);
 
       // Adaptive Mutation (restricted to Top N pool)
       const mutationRate = 0.1; // Consistent mutation rate
-      if (Math.random() < mutationRate) {
-        const idx = Math.floor(Math.random() * K);
-        let newN = numPool[Math.floor(Math.random() * numPool.length)];
+      if (rng() < mutationRate) {
+        const idx = Math.floor(rng() * K);
+        let newN = numPool[Math.floor(rng() * numPool.length)];
         // Ensure strictly new number
         while (offspring.includes(newN)) {
-          newN = numPool[Math.floor(Math.random() * numPool.length)];
+          newN = numPool[Math.floor(rng() * numPool.length)];
         }
         offspring[idx] = newN;
         offspring.sort((a, b) => a - b);
