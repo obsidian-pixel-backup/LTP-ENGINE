@@ -580,7 +580,10 @@ export function generateCandidateSets(
   // 5. Monte Carlo Optimized (20,000 trials + Seeded Sampling)
   {
     const totalComposite = scores.reduce((s, x) => s + x.compositeScore, 0);
-    const probDist = scores.map((s) => s.compositeScore / totalComposite);
+    const probDist =
+      totalComposite > 0
+        ? scores.map((s) => s.compositeScore / totalComposite)
+        : scores.map(() => 1 / Math.max(1, scores.length));
     let bestMC: number[] = [];
     let bestMCScore = -Infinity;
 
@@ -801,13 +804,13 @@ export function generateCandidateSets(
     // Follow the strongest 2-step chains starting from last draw's numbers
     for (const startNum of lastNums) {
       const step1 = diagnostics.transitions.find(
-        (t) => t.fromNumber === startNum,
+        (t) => t.lag === 1 && t.fromNumber === startNum,
       );
       if (step1 && step1.toNumbers.length > 0) {
         const next1 = step1.toNumbers[0].number;
         chainSet.add(next1);
         const step2 = diagnostics.transitions.find(
-          (t) => t.fromNumber === next1,
+          (t) => t.lag === 1 && t.fromNumber === next1,
         );
         if (step2 && step2.toNumbers.length > 0) {
           chainSet.add(step2.toNumbers[0].number);
@@ -905,6 +908,29 @@ export function backtest(
   N: number,
   trainRatio = 0.8, // Updated to 80/20 as requested
 ): BacktestResult {
+  if (draws.length < 2) {
+    const diagnostics = runFullDiagnostics(draws);
+    return {
+      trainSize: draws.length,
+      testSize: 0,
+      modelHits: 0,
+      baselineHitRate: 7 / N,
+      modelHitRate: 0,
+      improvement: 0,
+      top6Overlap: 0,
+      rowDetails: [],
+      profilePerformance: WEIGHT_PROFILES.map((p) => ({
+        name: p.name,
+        overlap: 0,
+      })),
+      finalDiagnostics: diagnostics,
+      finalBestProfile: WEIGHT_PROFILES[0],
+      learningTrend: 0,
+      earlyMatches: 0,
+      recentMatches: 0,
+    };
+  }
+
   const splitIdx = Math.floor(draws.length * trainRatio);
   const trainDraws = draws.slice(0, splitIdx);
   const testDraws = draws.slice(splitIdx);
@@ -1043,7 +1069,8 @@ export function backtest(
     }
   }
 
-  const avgTop6Overlap = top6TotalOverlap / testDraws.length;
+  const avgTop6Overlap =
+    testDraws.length > 0 ? top6TotalOverlap / testDraws.length : 0;
   const modelHitRate = avgTop6Overlap / K; // Hits per prediction slot
   const baselinePercentage = 7 / N; // Probability of random number being a winner
 
