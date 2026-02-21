@@ -13,6 +13,7 @@ class LottoViewer {
   private headers: string[] = [];
   private drawRecords: DrawRecord[] = [];
   private poolSize: number = 52;
+  private predictionTimer: number | null = null;
 
   // DOM Elements
   private fileInput = document.getElementById("fileInput") as HTMLInputElement;
@@ -120,7 +121,7 @@ class LottoViewer {
       this.saveToSessionStorage();
       this.parseDrawRecords();
       this.applyFilters();
-      this.runPredictionEngine();
+      this.schedulePredictionEngine(25);
     } catch (error) {
       console.error("Error parsing Excel:", error);
       alert("Failed to parse Excel file. Please ensure it's a valid XLSX.");
@@ -230,7 +231,7 @@ class LottoViewer {
 
     this.parseDrawRecords();
     this.applyFilters();
-    this.runPredictionEngine();
+    this.schedulePredictionEngine();
 
     // Clear inputs
     this.manualNums.forEach((input) => (input.value = ""));
@@ -259,7 +260,7 @@ class LottoViewer {
       this.saveToSessionStorage();
       this.parseDrawRecords();
       this.applyFilters();
-      this.runPredictionEngine();
+      this.schedulePredictionEngine();
     }
   }
 
@@ -495,7 +496,7 @@ class LottoViewer {
       // Small delay to allow UI to update
       await new Promise((resolve) => setTimeout(resolve, 100));
 
-      this.runPredictionEngine();
+      this.schedulePredictionEngine();
 
       // Small delay to show completion
       await new Promise((resolve) => setTimeout(resolve, 300));
@@ -527,6 +528,18 @@ class LottoViewer {
     });
     const warning = document.getElementById("predictionWarning");
     if (warning) warning.textContent = "Recalculating statistical model...";
+  }
+
+  private schedulePredictionEngine(delayMs = 0) {
+    if (this.predictionTimer !== null) {
+      window.clearTimeout(this.predictionTimer);
+      this.predictionTimer = null;
+    }
+
+    this.predictionTimer = window.setTimeout(() => {
+      this.predictionTimer = null;
+      this.runPredictionEngine();
+    }, delayMs);
   }
 
   private runPredictionEngine() {
